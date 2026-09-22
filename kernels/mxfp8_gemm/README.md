@@ -12,7 +12,9 @@ quantized copies per weight (~1.03x bf16). With a kernel that consumes MN-major
 operands directly, the 32x32 square-block format (torchao #4777:
 one qdata + dual swizzled scale frames) suffices: ~0.53x bf16.
 
-Upstream tracking: pytorch/ao#4932, pytorch/pytorch#198126.
+Upstream tracking: pytorch/ao#4932, pytorch/pytorch#198126 (both closed by us —
+TN-only is the long-standing FP8 restriction unchanged since sm_90; dual-copy
+quantized weights are established industry practice, hence this kernel).
 
 ## Contents
 
