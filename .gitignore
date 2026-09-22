@@ -24,21 +24,29 @@ env/
 # ncu profiler reports are large binaries; regenerate via prof/*.sh harnesses.
 *.ncu-rep
 
-# Build artifacts: compiled CUDA executables are built in-place next to their .cu
-# sources in bench/ and tests/. Ignore everything in those dirs, then re-include
-# only the source files (and let git recurse into subdirs like csrc/, cutlass_ex/).
+# Build artifacts: compiled CUDA executables are built in-place next to their
+# sources in kernels/<op>/{bench,tests}/ and perf_probe/. Ignore everything in
+# those dirs, then re-include only source files (and let git recurse into
+# subdirs like csrc/, cutlass_ex/).
 *.log
-/bench/**
-/tests/**
-!/bench/**/
-!/tests/**/
-!/bench/**/*.cu
-!/bench/**/*.cuh
-!/bench/**/*.py
-!/bench/**/*.sh
-!/bench/**/*.md
-!/tests/**/*.cu
-!/tests/**/*.cuh
-!/tests/**/*.py
-!/tests/**/*.sh
-!/tests/**/*.md
+/kernels/attn_sm120/bench/**
+/kernels/attn_sm120/tests/**
+/kernels/mxfp8_gemm/bench/**
+/perf_probe/**
+!/kernels/attn_sm120/bench/**/
+!/kernels/attn_sm120/tests/**/
+!/kernels/mxfp8_gemm/bench/**/
+!/perf_probe/**/
+!/kernels/attn_sm120/bench/**/*.cu
+!/kernels/attn_sm120/bench/**/*.cuh
+!/kernels/attn_sm120/bench/**/*.py
+!/kernels/attn_sm120/bench/**/*.sh
+!/kernels/attn_sm120/bench/**/*.md
+!/kernels/attn_sm120/tests/**/*.cu
+!/kernels/attn_sm120/tests/**/*.cuh
+!/kernels/attn_sm120/tests/**/*.py
+!/kernels/attn_sm120/tests/**/*.sh
+!/kernels/attn_sm120/tests/**/*.md
+!/kernels/attn_sm120/tests/**/*.cpp
+!/kernels/mxfp8_gemm/bench/**/*.cu
+!/perf_probe/**/*.cu
