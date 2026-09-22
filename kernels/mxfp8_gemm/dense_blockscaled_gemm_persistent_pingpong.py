@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import os
 from typing import Tuple, Type, Optional
 
 import cuda.bindings.driver as cuda
@@ -36,6 +37,24 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import testing
 import cutlass.utils as utils
+
+
+def _st_shared_v2_u32(smem_addr, lo, hi):
+    from cutlass._mlir.dialects import llvm
+
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_addr).ir_value(),
+            cutlass.Int32(lo).ir_value(),
+            cutlass.Int32(hi).ir_value(),
+        ],
+        "st.shared.v2.u32 [$0], {$1, $2};",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 import cutlass.pipeline as pipeline
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -331,6 +350,12 @@ class Sm120BlockScaledGemmKernel:
         self.b_manual_load = (
             self.b_dtype.width == 8 and self.b_layout.is_n_major_b()
         )
+        if cutlass.const_expr(self.b_manual_load):
+            # v2 PRMT in-register transpose needs ~64 regs in the load
+            # warpgroup; rebalance 256*224 + 128*64 = 65536 (the stock TMA
+            # path keeps 232/40).
+            self.load_register_requirement = 64
+            self.mma_register_requirement = 216
 
         self._setup_attributes()
 
@@ -658,6 +683,15 @@ class Sm120BlockScaledGemmKernel:
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
+        if cutlass.const_expr(self.b_manual_load):
+            # Swizzle-in-layout view for the manual B producer: keeps the
+            # pointer plain so crd2idx(coord, layout) yields the final
+            # swizzled byte offset directly.
+            sB_sw = storage.sB.get_tensor(
+                cute.make_composed_layout(
+                    b_smem_layout_staged.inner, 0, b_smem_layout_staged.outer
+                )
+            )
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
@@ -881,17 +915,101 @@ class Sm120BlockScaledGemmKernel:
                             b_pipeline.producer_acquire(b_producer_state)
                             gB_k = gB_nk[(None, None, b_producer_state.count)]
                             sB_stage = sB[(None, None, b_producer_state.index)]
-                            for p in range(11):
-                                c = ltid + 96 * p
-                                if c < 1024:
+                            # v3: each thread transposes one 8(k) x 16(n)
+                            # half-block in registers via PRMT and stores u64s
+                            # into the swizzled K-major stage. Thread mapping
+                            # kk = c%16 (kr = 8*kk), nb = c//16 (n0 = 16*nb)
+                            # makes a warp cover 2 n-blocks x 16 k-slots: every
+                            # store instruction hits exactly 2 SMEM segments
+                            # with all 32 banks distinct (conflict-free).
+                            # NOTE: cute.recast_tensor on the swizzled SMEM
+                            # tensor yields a wrong layout (silent); compute
+                            # swizzled byte offsets via crd2idx on a
+                            # swizzle-in-layout view instead.
+                            sB_sw_stage = sB_sw[
+                                (None, None, b_producer_state.index)
+                            ]
+                            for q_iter in range(2):
+                                c = ltid + 96 * q_iter
+                                if c < 128:
                                     n0 = (c % 8) * 16
-                                    kp = c // 8
-                                    row = gB_k[(None, kp)]
-                                    frag = cute.make_tensor(
-                                        row.iterator + n0, cute.make_layout(16)
-                                    ).load()
-                                    for e in range(16):
-                                        sB_stage[(n0 + e, kp)] = frag[e]
+                                    kr = (c // 8) * 8
+                                    in_frag = cute.make_rmem_tensor(
+                                        cute.make_layout((8, 16), stride=(16, 1)),
+                                        self.b_dtype,
+                                    )
+                                    for r in range(8):
+                                        row = gB_k[(None, kr + r)]
+                                        lptr = (row.iterator + n0).align(16)
+                                        in_frag[r, None].store(
+                                            cute.make_tensor(
+                                                lptr, cute.make_layout(16)
+                                            ).load()
+                                        )
+                                    in_i32 = cute.recast_tensor(
+                                        in_frag, cutlass.Int32
+                                    )
+                                    # off(n0+nn, kr) = off(n0,kr) + (nn//8)*1024
+                                    # + (nn%8)*128 + ((kr ^ ((nn%8)<<4)) - kr)
+                                    base_ptr = sB_sw_stage.iterator + cute.crd2idx(
+                                        (n0, kr), sB_sw_stage.layout
+                                    )
+                                    for nn in range(16):
+                                        lane = nn // 4
+                                        pos = nn % 4
+                                        sel01 = (
+                                            pos
+                                            | ((4 + pos) << 4)
+                                            | (pos << 8)
+                                            | ((4 + pos) << 12)
+                                        )
+                                        lo = cutlass.Int32(
+                                            cute.arch.prmt(
+                                                cutlass.Int32(
+                                                    cute.arch.prmt(
+                                                        in_i32[0, lane],
+                                                        in_i32[1, lane],
+                                                        sel01,
+                                                    )
+                                                ),
+                                                cutlass.Int32(
+                                                    cute.arch.prmt(
+                                                        in_i32[2, lane],
+                                                        in_i32[3, lane],
+                                                        sel01,
+                                                    )
+                                                ),
+                                                0x5410,
+                                            )
+                                        )
+                                        hi = cutlass.Int32(
+                                            cute.arch.prmt(
+                                                cutlass.Int32(
+                                                    cute.arch.prmt(
+                                                        in_i32[4, lane],
+                                                        in_i32[5, lane],
+                                                        sel01,
+                                                    )
+                                                ),
+                                                cutlass.Int32(
+                                                    cute.arch.prmt(
+                                                        in_i32[6, lane],
+                                                        in_i32[7, lane],
+                                                        sel01,
+                                                    )
+                                                ),
+                                                0x5410,
+                                            )
+                                        )
+                                        m = nn % 8
+                                        off = (
+                                            (nn // 8) * 1024
+                                            + m * 128
+                                            + ((kr ^ (m << 4)) - kr)
+                                        )
+                                        _st_shared_v2_u32(
+                                            (base_ptr + off).toint(), lo, hi
+                                        )
                             b_pipeline.producer_commit(b_producer_state)
                             b_producer_state.advance()
 
@@ -1886,6 +2004,13 @@ def run_bs(
 
     a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
     b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
+    if os.environ.get("B_ONES"):
+        b_ref.fill_(1.0)
+    elif os.environ.get("B_PATTERN"):
+        nn = torch.arange(n, device=b_ref.device).view(n, 1, 1)
+        kk = torch.arange(k, device=b_ref.device).view(1, k, 1)
+        pat = ((nn * 7 + kk * 3) % 13).float() * 0.25 - 1.5
+        b_ref.copy_(pat.expand(n, k, l))
     c_ref = cutlass_torch.matrix(l, m, n, c_major == "m", cutlass.Float32)
 
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(

@@ -23,11 +23,16 @@ quantized weights are established industry practice, hence this kernel).
   Our changes vs upstream (see also `patch_v1.py`):
   - CLI majors relaxed (a_major k/m, b_major k/n, c_major n/m)
   - `b_manual_load` mode (fp8 + n-major B): warps 9-11 (idle in the stock
-    example) copy B manually: `ld.global.v4` 16B gmem N'-runs -> 16x scalar
-    `st.shared` into the standard swizzled K-major SMEM layout
+    example) copy B manually into the standard swizzled K-major SMEM layout
     (transpose-by-placement), guarded by an extra `PipelineAsync`
     (producer 96 threads, consumer one MMA warpgroup). MMA/ldmatrix/epilogue
     untouched; TMA path for A/SFA/SFB and the whole TN path byte-identical.
+    v3 details: each thread transposes an 8(k)x16(n) half-block in registers
+    via PRMT (2-level byte gather), stores u64 via inline-asm
+    `st.shared.v2.u32`; loads are `.align(16)`-annotated LDG.E.128 with an
+    n-fast lane mapping (coalescing beats bank spread: loads were the real
+    bottleneck). Register budget rebalanced when manual: MMA 232->216,
+    load wg 40->64 (setmaxregister values must be multiples of 8).
   - tx_count excludes B in manual mode; dummy TMA-B atom; divisibility=16
     marking for n-major B; N%128==0 && K%128==0 gate for the manual path.
 - `blockscaled_gemm_dispatch.py` — shared dispatch helpers (unmodified).
@@ -40,9 +45,9 @@ quantized weights are established industry practice, hence this kernel).
 | path | time | note |
 |---|---|---|
 | cuBLAS TN (torch._scaled_mm) | 542us | reference |
-| DSL k,k (TN) | 754us | stock example perf |
-| DSL k,n (NT, v1 manual-B) | 2409us | v0 scalar was 5255us |
-| bf16 cuBLAS | 1674us | target to beat |
+| DSL k,k (TN) | 754-760us | stock example perf (unchanged) |
+| DSL k,n (NT, v3 manual-B) | **1390-1486us** | beats bf16; v1 2409us, v0 5255us |
+| bf16 cuBLAS | 1674us | beaten |
 
 Correctness: all of k,k / k,n / m,k / m,n pass the built-in reference check.
 
@@ -59,12 +64,17 @@ Needs: `nvidia-cutlass-dsl` (tested 4.7.1), torch, sm_120 GPU.
 
 ## Known bottlenecks / TODO
 
-- Manual B store side is 16x scalar `st.shared` per 16B gmem load
-  (byte-granularity transpose cannot vectorize both sides — K-major SMEM 16B
-  units are 16 consecutive k', gmem runs are 16 consecutive n'). Options:
-  (a) PRMT register transpose + `st.shared.u32` (~1.5x, est. 1400-1600us);
-  (b) ldmatrix/stmatrix u16-trick SMEM transpose staging (est. 800-1100us);
-  (c) pull warp 8 into the manual copy (marginal).
+- v3 store side still ~4-way bank-conflicted (n-stride 128B aliases banks);
+  conflict-free stores need k-fast lanes, which breaks gmem coalescing —
+  resolving both requires cross-thread exchange (shfl butterfly or an SMEM
+  staging + ldmatrix/stmatrix u16-trick round trip, est. 800-1100us).
+- Residual register spills in producer (LDL/STL ~18, STACK 96) at 64 regs.
+- DSL pitfalls encoded in the code comments: `cute.recast_tensor` on a
+  swizzled SMEM tensor silently yields a wrong layout (use a
+  swizzle-in-layout view + `crd2idx` instead); `.load()` vectorization and
+  `recast_ptr` drops alignment info unless `.align(16)` re-annotates;
+  `nvvm.setmaxregister` values must be multiples of 8; verify widths in SASS
+  (`nvdisasm`), never trust source-level intuition.
 - a_major="m" (wgrad-style transposed mat_a) still uses the slow v0 universal
   fallback; same manual-load treatment applies.
 - Scheduler: StaticPersistent grid-stride is fine for dense; if we add L2
