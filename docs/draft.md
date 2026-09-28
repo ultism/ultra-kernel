@@ -478,3 +478,20 @@ under sustained load — only same-session A/B is trustworthy):
 Total bwd via ext (H32/S16896): mode1 166.7 -> 155.5ms, mode3 152.0 ->
 152.8ms (fused still ahead; gap narrowed because split gained too).
 Bitwise mode3==mode1 preserved at both shapes.
+
+### c17: quad redux.sync amax — REJECTED (+50%)
+
+__reduce_max_sync with a quad membermask (0xf << (lane&~3)) regressed
+dvdk2 100 -> 150ms (tensor 60.5 -> 40.2%). Partial-mask redux.sync is not
+the hardware fast path (full-warp only) — compiles to something far worse
+than 2x shfl_xor. Reverted. Lesson logged.
+
+KernelWiki (B200) mining for dvdk2: nothing else transferable.
+- pingpong/TMEM acc offload: SM100-only (wiki pattern-register-pressure
+  says so explicitly); our two-tile acc state needs +64 regs — walled.
+- 2-CTA/DSMEM/CLC: targets TMA/DRAM/tail — all non-bottlenecks here
+  (DRAM 6%, 91.8 waves).
+- software exp (FA4): motivated by B200 tensor:SFU 2:1 asymmetry; our XU
+  pipe is 8.5% — and would break bitwise parity with mode 1.
+- scale_vec::2X (k64 blockscaled mma): fp4-only; fp8 has k32 only.
+Wiki confirms the dq-separate + dvdk-fused structure matches FA4's split.
