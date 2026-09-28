@@ -131,8 +131,12 @@ __device__ __forceinline__ Element quant_e4m3(float v, int se) {
   return Element(v * exp2f(float(-se)));
 }
 __device__ __forceinline__ int mx_scale_exp(float amax) {
-  if (amax <= 0.f) return -126;
-  int e = (int)ceilf(log2f(amax)) - 8;
+  // c15: bit-exact ceil(log2(x))-8 without MUFU (normal x>0:
+  // ceil(log2(x)) == exp_unbiased + (mantissa != 0)).
+  uint32_t b = __float_as_uint(amax);
+  if ((b & 0x7fffffffu) == 0 || (b & 0x7f800000u) == 0) return -126;   // zero/subnormal
+  if ((b & 0x7f800000u) == 0x7f800000u) return 127;                    // inf/nan
+  int e = int(b >> 23) - 127 + ((b & 0x007fffffu) != 0 ? 1 : 0) - 8;
   return max(-126, min(127, e));
 }
 

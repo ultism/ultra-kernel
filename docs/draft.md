@@ -447,3 +447,34 @@ small-shape +9.1% (was +6.0%/+5.0% pre-c15).
 Remaining stall map: wait 34.8% (mma chain depth, register-walled),
 SF fills ~4%, TT ring sleeping ~2%, exp2f ~4.5% (ex2.approx would break
 bitwise parity with mode 1 — deferred).
+
+### c16: atom layout (8,1,1) -> (4,2,1) at kv=128 tiles
+
+LSU pipe at 56.7% vs tensor 60.5% — co-bottleneck. Root cause: mma.sync has
+no smem-descriptor path on sm_120; with atom layout (8,1,1) every warp LDSMs
+the full B operand => 8x replication (wavefront accounting matches 2.98e9:
+288 wf/warp/tile, B = 64 wf of it per gemm). (4,2,1): B replication 8x -> 4x,
+A 1x -> 2x; est. 288 -> ~192 wf/warp/tile (-33% LSU). Prior kv=64 (4,2,1)
+failure was tile-size/pipeline, not the layout itself (per user).
+Risk: quant epilogue mappings (rc_view/shfl_fill/lse-dist/amax pairs/SF
+fills) are all hand-derived for (8,1,1); re-derive for (4,2,1). Port from
+s3b_dvdk_ws_kernel.cuh (4,2,1) where shapes match; host-probe coords.
+
+### c15b: port bit-exact mx_scale_exp to dq/dk/dv_ws
+
+dQ fusion into dvdk2 analyzed and REJECTED (design note): dQ sums over the
+kv axis; a kv-stationary kernel only has partial sums => cross-CTA reduction
+(132 kv tiles x 277MB dQ = 36.6GB atomic traffic ~100ms+, or 36.6GB
+workspace > VRAM). Symmetric dead end for q-stationary dK/dV. FA2/FA3 split
+(q-stationary dQ + kv-stationary dKdV) is the optimum; we match it. The
+S'+dP recompute across the two kernels is the (cheaper) price.
+
+But c15's mx_scale_exp bit-trick ported to the three split kernels
+(their lse/dlt are loop-invariant, no LDG prefetch needed there).
+Within-session ncu A/B (CAUTION: base clock drifts ~13% across sessions
+under sustained load — only same-session A/B is trustworthy):
+  dq_ws 71-73 -> 64.5-68.8ms (-6%), dk_ws 73.3 -> 65.3-67.6 (-9%),
+  dv_ws ~flat (its P' uses const scale; mx_scale_exp not hot).
+Total bwd via ext (H32/S16896): mode1 166.7 -> 155.5ms, mode3 152.0 ->
+152.8ms (fused still ahead; gap narrowed because split gained too).
+Bitwise mode3==mode1 preserved at both shapes.
