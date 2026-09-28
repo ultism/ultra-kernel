@@ -378,7 +378,7 @@ extern "C" __global__ void quant_nat_kernel(
   union { uint8_t b[32]; uint4 v[2]; } out;
   int b = 1;
   if (r < L) {
-    const __nv_bfloat16* src = x + goff;
+    const __nv_bfloat16* src = x + ((size_t)h * L + r) * 128 + kb * 32;
     float amax = 0.f;
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(__bfloat162float(src[j])));
@@ -406,7 +406,7 @@ extern "C" __global__ void __launch_bounds__(128) quant_trn_kernel(
   int const s0 = kb * 32;
   for (int i = tid; i < 32 * 128; i += 128) {
     int s = i / 128, d = i % 128;
-    tile[s][d] = (s0 + s < L) ? x[((size_t)h * S + s0 + s) * 128 + d] : __float2bfloat16(0.f);
+    tile[s][d] = (s0 + s < L) ? x[((size_t)h * L + s0 + s) * 128 + d] : __float2bfloat16(0.f);
   }
   __syncthreads();
   int const d = tid;
