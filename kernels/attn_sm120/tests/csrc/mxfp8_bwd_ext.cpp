@@ -19,7 +19,9 @@ extern "C" void mxfp8_dk_ws_launch(
     const void*, const void*, const void*, const void*, const void*,
     const float*, const float*, float*, int, int, float, uintptr_t);
 extern uint8_t* g_dvdk_dbg;
-extern "C" void quant_nat_launch(const void*, void*, void*, void*, int, int, int, uintptr_t);
+extern "C" void quant_nat_launch(const void*, void*, void*, void*, int, int, int, uintptr_t, void*);
+extern "C" void scale_slice_cast_launch(const void*, const void*, const void*, void*, void*, void*,
+                                        float, int, int, int, uintptr_t);
 extern "C" void quant_trn_launch(const void*, void*, void*, void*, int, int, int, uintptr_t);
 extern "C" void mxfp8_dvdk_ws_launch(
     const void*, const void*, const void*, const void*, const void*, const void*,
@@ -54,7 +56,7 @@ static std::vector<at::Tensor> mxfp8_bwd(
   return {dQ, dK, dV};
 }
 
-static std::vector<at::Tensor> quant_op(at::Tensor x, bool transposed) {
+static std::vector<at::Tensor> quant_op(at::Tensor x, bool transposed, at::Tensor* qT_out = nullptr) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.dim() == 3 && x.size(2) == 128);
   auto xc = x.contiguous();
   const int H = xc.size(0), L = xc.size(1);
@@ -65,8 +67,10 @@ static std::vector<at::Tensor> quant_op(at::Tensor x, bool transposed) {
     q = at::empty({H, S, 128}, u8);
     sf_raw = at::empty({H, S, 4}, u8);
     sf_pack = at::empty({H, S / 128, 512}, u8);
+    if (qT_out != nullptr) *qT_out = at::empty({S, H, 128}, u8);
     quant_nat_launch(xc.data_ptr(), q.data_ptr(), sf_raw.data_ptr(), sf_pack.data_ptr(),
-                     H, S, L, uintptr_t(at::cuda::getCurrentCUDAStream().stream()));
+                     H, S, L, uintptr_t(at::cuda::getCurrentCUDAStream().stream()),
+                     qT_out ? qT_out->data_ptr() : nullptr);
   } else {
     q = at::empty({H, 128, S}, u8);
     sf_raw = at::empty({H, 128, S / 32}, u8);
@@ -145,9 +149,15 @@ static std::vector<at::Tensor> fwd_attn(
   }
   const RaggedPlan& pl = it->second;
   auto opts_f = at::TensorOptions().dtype(at::kFloat).device(QdT.device());
-  // pad q-tiles are skipped by the plan; zero-fill so bwd's delta/lse never see garbage bits
-  at::Tensor O = at::zeros({S, Hq, D}, opts_f);
-  at::Tensor LSE = at::zeros({Hq, S}, opts_f);
+  // pad q-tiles are skipped by the plan; zero ONLY the uncomputed tail so bwd's
+  // delta/lse never see garbage bits (whole-tensor zeros when L%128 != 0)
+  at::Tensor O = at::empty({S, Hq, D}, opts_f);
+  at::Tensor LSE = at::empty({Hq, S}, opts_f);
+  const int covered = ((L + 127) / 128) * 128;
+  if (covered < S) {
+    O.narrow(0, covered, S - covered).zero_();
+    LSE.narrow(1, covered, S - covered).zero_();
+  }
   at::Tensor Lout = at::empty({Hq, S}, opts_f);
   s3_ragged_mx_launch(QdT.data_ptr(), KdT.data_ptr(), Vt.data_ptr(),
                       sfQ.data_ptr(), sfK.data_ptr(), sfV.data_ptr(),
@@ -166,14 +176,13 @@ static std::vector<at::Tensor> fwd_attn(
 // [S,H,D] transposed copies the ragged fwd kernel wants. One pybind crossing.
 // Returns: qdT, kdT, vt, rq, rk, rvt, qd, kd, vd, qt, kt, sfq, sfk, sfv, sfqt, sfkt
 static std::vector<at::Tensor> fwd_prep(at::Tensor q, at::Tensor k, at::Tensor v) {
-  auto qn = quant_op(q, false);   // qd, rq, sfq
-  auto kn = quant_op(k, false);
+  at::Tensor qdT, kdT;
+  auto qn = quant_op(q, false, &qdT);   // qd, rq, sfq  (+ qdT [S,H,D] written in-kernel)
+  auto kn = quant_op(k, false, &kdT);
   auto vn = quant_op(v, false);
   auto qt_ = quant_op(q, true);   // qt, rqt, sfqt
   auto kt_ = quant_op(k, true);
   auto vt_ = quant_op(v, true);
-  at::Tensor qdT = qn[0].permute({1, 0, 2}).contiguous();
-  at::Tensor kdT = kn[0].permute({1, 0, 2}).contiguous();
   return {qdT, kdT, vt_[0], qn[1], kn[1], vt_[1],
           qn[0], kn[0], vn[0], qt_[0], kt_[0],
           qn[2], kn[2], vn[2], qt_[2], kt_[2], vt_[2]};
@@ -200,12 +209,17 @@ static std::vector<at::Tensor> bwd_full(
   auto grads = mxfp8_bwd(Qd, Kd, Vd, dn[0], Qt, Kt, dt_[0],
                          sfQ, sfK, sfV, dn[2], sfQt, sfKt, dt_[2],
                          lse_, delta, sm_scale, mode);
-  // kernels fold sm_scale into P only; dQ/dK need the exact post-scale
-  grads[0].mul_(sm_scale);
-  grads[1].mul_(sm_scale);
-  return {grads[0].narrow(1, 0, L).to(at::kBFloat16),
-          grads[1].narrow(1, 0, L).to(at::kBFloat16),
-          grads[2].narrow(1, 0, L).to(at::kBFloat16)};
+  // kernels fold sm_scale into P only; dQ/dK get the exact fp32 post-scale here,
+  // fused with the L-slice + bf16 cast in one kernel
+  auto opts_o = at::TensorOptions().dtype(at::kBFloat16).device(do_.device());
+  at::Tensor oq = at::empty({H, L, 128}, opts_o);
+  at::Tensor ok = at::empty({H, L, 128}, opts_o);
+  at::Tensor ov = at::empty({H, L, 128}, opts_o);
+  scale_slice_cast_launch(grads[0].data_ptr(), grads[1].data_ptr(), grads[2].data_ptr(),
+                          oq.data_ptr(), ok.data_ptr(), ov.data_ptr(),
+                          float(sm_scale), H, S, L,
+                          uintptr_t(at::cuda::getCurrentCUDAStream().stream()));
+  return {oq, ok, ov};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

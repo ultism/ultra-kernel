@@ -366,10 +366,12 @@ __device__ __forceinline__ uint8_t q_e4m3(float v) {
 }
 
 // one thread per 32-element group along d. grid covers H*S*4 threads.
+// qT (nullable): second output in token-major [S,H,D] layout for the fwd kernel --
+// written in the same pass, saves a separate 18MB-per-tensor permute+copy.
 extern "C" __global__ void quant_nat_kernel(
     const __nv_bfloat16* __restrict__ x, uint8_t* __restrict__ q,
     uint8_t* __restrict__ sf_raw, uint8_t* __restrict__ sf_pack,
-    int H, int S, int L) {
+    int H, int S, int L, uint8_t* __restrict__ qT = nullptr) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int groups = S * 4;
   if (idx >= H * groups) return;
@@ -391,8 +393,39 @@ extern "C" __global__ void quant_nat_kernel(
   }
   reinterpret_cast<uint4*>(q + goff)[0] = out.v[0];
   reinterpret_cast<uint4*>(q + goff)[1] = out.v[1];
+  if (qT != nullptr) {
+    size_t toff = ((size_t)r * H + h) * 128 + kb * 32;
+    reinterpret_cast<uint4*>(qT + toff)[0] = out.v[0];
+    reinterpret_cast<uint4*>(qT + toff)[1] = out.v[1];
+  }
   sf_raw[((size_t)h * S + r) * 4 + kb] = uint8_t(b);
   sf_pack[(size_t)h * (S / 128) * 512 + (r / 128) * 512 + 16 * (r % 32) + 4 * ((r % 128) / 32) + kb] = uint8_t(b);
+}
+
+// fused bwd postprocess: out[i] = bf16(in[i] * scale) sliced to L rows, 3 tensors in one launch.
+extern "C" __global__ void scale_slice_cast_kernel(
+    const float* __restrict__ dq, const float* __restrict__ dk, const float* __restrict__ dv,
+    __nv_bfloat16* __restrict__ oq, __nv_bfloat16* __restrict__ ok, __nv_bfloat16* __restrict__ ov,
+    float sm, int H, int S, int L) {
+  int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = int64_t(H) * L * 128;
+  if (idx >= total) return;
+  int d = int(idx % 128); int64_t hl = idx / 128;
+  int l = int(hl % L), h = int(hl / L);
+  size_t src = ((size_t)h * S + l) * 128 + d;
+  oq[idx] = __float2bfloat16(dq[src] * sm);
+  ok[idx] = __float2bfloat16(dk[src] * sm);
+  ov[idx] = __float2bfloat16(dv[src]);
+}
+
+extern "C" void scale_slice_cast_launch(
+    const void* dq, const void* dk, const void* dv, void* oq, void* ok, void* ov,
+    float sm, int H, int S, int L, uintptr_t stream_) {
+  int64_t total = int64_t(H) * L * 128;
+  int blocks = int((total + 255) / 256);
+  scale_slice_cast_kernel<<<blocks, 256, 0, (cudaStream_t)stream_>>>(
+      (const float*)dq, (const float*)dk, (const float*)dv,
+      (__nv_bfloat16*)oq, (__nv_bfloat16*)ok, (__nv_bfloat16*)ov, sm, H, S, L);
 }
 
 // block = one (head, 32-token group): smem tile 32x128, 128 threads.
@@ -426,10 +459,11 @@ extern "C" __global__ void __launch_bounds__(128) quant_trn_kernel(
 }
 
 extern "C" void quant_nat_launch(const void* x, void* q, void* sf_raw, void* sf_pack,
-                                 int H, int S, int L, uintptr_t stream_) {
+                                 int H, int S, int L, uintptr_t stream_, void* q_trn = nullptr) {
   int total = H * S * 4;
   quant_nat_kernel<<<(total + 255) / 256, 256, 0, (cudaStream_t)stream_>>>(
-      (const __nv_bfloat16*)x, (uint8_t*)q, (uint8_t*)sf_raw, (uint8_t*)sf_pack, H, S, L);
+      (const __nv_bfloat16*)x, (uint8_t*)q, (uint8_t*)sf_raw, (uint8_t*)sf_pack, H, S, L,
+      (uint8_t*)q_trn);
 }
 extern "C" void quant_trn_launch(const void* x, void* qt, void* sf_raw, void* sf_pack,
                                  int H, int S, int L, uintptr_t stream_) {
