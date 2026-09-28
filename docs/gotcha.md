@@ -948,3 +948,5 @@ RTX 5090's SM count). Patched to query
 `getCurrentDeviceProperties()->multiProcessorCount` so the persistent grid is
 correct on any GPU (36 on the 5060 Ti) — otherwise persistent over-subscribes
 170 CTAs onto 36 SMs and the A/B is polluted before it starts.
+
+## sm120 smem optin limit is **101376B** (99KB), NOT 228KB — RTX 5060 Ti (GB206) has 100KB smem/SM total. `cudaFuncSetAttribute(MaxDynamicSharedMemorySize, >101376)` fails with `invalid argument` (NOT `invalid value` — misleading). Any fused/multi-ring design over ~96KB of data + SF + barriers simply does not launch. (Killed the 2-stage fused dvdk2@kv128: 105472B; had to drop the Qt/Dt ring to single-stage to fit.)

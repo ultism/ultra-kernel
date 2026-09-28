@@ -14,6 +14,7 @@
 #include "../s3b_dk_ws_kernel.cuh"
 #include "../s3b_dv_ws_kernel.cuh"
 #include "../s3b_dvdk_ws_kernel.cuh"
+#include "../s3b_dvdk2_kernel.cuh"
 
 using cute::Int;
 uint8_t* g_dvdk_dbg = nullptr;
@@ -65,11 +66,19 @@ extern "C" void mxfp8_dk_ws_launch(
                                             make_shape(Int<128>{}, Int<D>{}), cute::_1{});
   p.tma_sfqt = cute::make_tma_copy<uint16_t>(cute::SM90_TMA_LOAD{}, mSFQt, s3bdkws::SmemLayoutSFT{},
                                              make_shape(Int<D>{}, Int<128>{}), cute::_1{});
+  cute::Tensor mLse = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<const uint8_t*>(lse)),
+      cute::make_layout(cute::make_shape(S * H * 4), cute::make_stride(cute::_1{})));
+  cute::Tensor mDlt = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<const uint8_t*>(delta)),
+      cute::make_layout(cute::make_shape(S * H * 4), cute::make_stride(cute::_1{})));
+  p.tma_lse = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mLse, cute::Layout<cute::Shape<cute::_256>>{},
+                                  cute::make_shape(cute::Int<256>{}), cute::_1{});
+  p.tma_dlt = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mDlt, cute::Layout<cute::Shape<cute::_256>>{},
+                                  cute::make_shape(cute::Int<256>{}), cute::_1{});
   p.layout_sfq = layoutSFQ;
   p.layout_sfqt = layoutSFQt;
   p.K = (const uint8_t*)Kd; p.V = (const uint8_t*)Vd;
   p.sfK = (const uint8_t*)sfK; p.sfV = (const uint8_t*)sfV;
-  p.lse = lse; p.delta = delta; p.dK = dK;
+  p.dK = dK;
   p.S = S; p.H = H; p.sm_scale = sm_scale;
   dim3 grid(S / s3bdkws::kBlockN, H);
   s3bdkws::dk_ws_kernel<<<grid, s3bdkws::kNThreads, int(sizeof(s3bdkws::SharedStorageDk)), stream>>>(p);
@@ -177,6 +186,72 @@ extern "C" void mxfp8_dvdk_ws_launch(
   s3bdvdk::dvdk_ws_kernel<<<grid, s3bdvdk::kNThreads, int(sizeof(s3bdvdk::SharedStorageDvDK)), stream>>>(p);
 }
 
+extern "C" void mxfp8_dvdk2_launch(
+    const void* Kd, const void* Vd,
+    const void* Qd, const void* Dd, const void* Qt, const void* Dt,
+    const void* sfK, const void* sfV, const void* sfQ, const void* sfD,
+    const void* sfQt, const void* sfDt,
+    const float* lse, const float* delta,
+    float* dV, float* dK, int S, int H, float sm_scale, uintptr_t stream_) {
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_);
+  static bool attr_done = false;
+  if (!attr_done) {
+    cudaFuncSetAttribute((const void*)s3bdvdk2::dvdk2_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         int(sizeof(s3bdvdk2::SharedStorageDvdk)));
+    attr_done = true;
+  }
+  constexpr int D = 128;
+  auto layoutSFQ = s3bdvdk2::BlkSF::tile_atom_to_shape_SFA(make_shape(S, int(s3bdvdk2::kBlockM), D, H));
+  auto layoutSFQt = s3bdvdk2::BlkSF::tile_atom_to_shape_SFB(make_shape(int(s3bdvdk2::kBlockN), D, S, H));
+  s3bdvdk2::ParamsDvdk p{};
+  auto nat = [&](const void* x) {
+    return cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::Element const*>(x)),
+        cute::make_layout(make_shape(S, D, H), make_stride(D, cute::_1{}, S * D)));
+  };
+  auto trn = [&](const void* x) {
+    return cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::Element const*>(x)),
+        cute::make_layout(make_shape(D, S, H), make_stride(S, cute::_1{}, D * S)));
+  };
+  cute::Tensor mQ = nat(Qd); cute::Tensor mD = nat(Dd);
+  cute::Tensor mQt = trn(Qt); cute::Tensor mDt = trn(Dt);
+  cute::Tensor mSFQ = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::ElementSF const*>(sfQ)), layoutSFQ);
+  cute::Tensor mSFD = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::ElementSF const*>(sfD)), layoutSFQ);
+  cute::Tensor mSFQt = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::ElementSF const*>(sfQt)), layoutSFQt);
+  cute::Tensor mSFDt = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::ElementSF const*>(sfDt)), layoutSFQt);
+  p.tma_q = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mQ, s3bdvdk2::SmemLayoutQ{}(_, _, cute::_0{}),
+                                make_shape(Int<s3bdvdk2::kBlockM>{}, Int<D>{}), cute::_1{});
+  p.tma_d = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mD, s3bdvdk2::SmemLayoutQ{}(_, _, cute::_0{}),
+                                make_shape(Int<s3bdvdk2::kBlockM>{}, Int<D>{}), cute::_1{});
+  p.tma_qt = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mQt, s3bdvdk2::SmemLayoutQt{}(_, _, cute::_0{}),
+                                 make_shape(Int<D>{}, Int<s3bdvdk2::kBlockM>{}), cute::_1{});
+  p.tma_dt = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mDt, s3bdvdk2::SmemLayoutQt{}(_, _, cute::_0{}),
+                                 make_shape(Int<D>{}, Int<s3bdvdk2::kBlockM>{}), cute::_1{});
+  p.tma_sfq = cute::make_tma_copy<uint16_t>(cute::SM90_TMA_LOAD{}, mSFQ, s3bdvdk2::SmemLayoutSFT{},
+                                            make_shape(Int<128>{}, Int<D>{}), cute::_1{});
+  p.tma_sfd = cute::make_tma_copy<uint16_t>(cute::SM90_TMA_LOAD{}, mSFD, s3bdvdk2::SmemLayoutSFT{},
+                                            make_shape(Int<128>{}, Int<D>{}), cute::_1{});
+  p.tma_sfqt = cute::make_tma_copy<uint16_t>(cute::SM90_TMA_LOAD{}, mSFQt, s3bdvdk2::SmemLayoutSFT{},
+                                             make_shape(Int<D>{}, Int<128>{}), cute::_1{});
+  p.tma_sfdt = cute::make_tma_copy<uint16_t>(cute::SM90_TMA_LOAD{}, mSFDt, s3bdvdk2::SmemLayoutSFT{},
+                                             make_shape(Int<D>{}, Int<128>{}), cute::_1{});
+  cute::Tensor mLse = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<const uint8_t*>(lse)),
+      cute::make_layout(cute::make_shape(S * H * 4), cute::make_stride(cute::_1{})));
+  cute::Tensor mDlt = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<const uint8_t*>(delta)),
+      cute::make_layout(cute::make_shape(S * H * 4), cute::make_stride(cute::_1{})));
+  p.tma_lse = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mLse, cute::Layout<cute::Shape<cute::_256>>{},
+                                  cute::make_shape(cute::Int<256>{}), cute::_1{});
+  p.tma_dlt = cute::make_tma_copy(cute::SM90_TMA_LOAD{}, mDlt, cute::Layout<cute::Shape<cute::_256>>{},
+                                  cute::make_shape(cute::Int<256>{}), cute::_1{});
+  p.layout_sfq = layoutSFQ; p.layout_sfqt = layoutSFQt; p.layout_sfdt = layoutSFQt;
+  p.K = (const uint8_t*)Kd; p.V = (const uint8_t*)Vd;
+  p.sfK = (const uint8_t*)sfK; p.sfV = (const uint8_t*)sfV;
+  p.lse_raw = lse; p.dlt_raw = delta;
+  p.dK = dK; p.dV = dV;
+  p.S = S; p.H = H; p.sm_scale = sm_scale;
+  dim3 grid(S / s3bdvdk2::kBlockN, H);
+  s3bdvdk2::dvdk2_kernel<false><<<grid, 256, int(sizeof(s3bdvdk2::SharedStorageDvdk)), stream>>>(p);
+}
+
 extern "C" void mxfp8_bwd_launch(
     const void* Qd, const void* Kd, const void* Vd, const void* Dd,
     const void* Qt, const void* Kt, const void* Dt,
@@ -219,6 +294,9 @@ extern "C" void mxfp8_bwd_launch(
   } else if (use_dk_ws == 2) {
     mxfp8_dvdk_ws_launch(Kd, Vd, Qd, Dd, Qt, Dt, sfK, sfV, sfQ, sfD, sfQt, sfDt,
                          lse, delta, dV, dK, S, H, sm_scale, stream_);
+  } else if (use_dk_ws == 3) {
+    mxfp8_dvdk2_launch(Kd, Vd, Qd, Dd, Qt, Dt, sfK, sfV, sfQ, sfD, sfQt, sfDt,
+                       lse, delta, dV, dK, S, H, sm_scale, stream_);
   }
 
   // ---- dq_ws ----

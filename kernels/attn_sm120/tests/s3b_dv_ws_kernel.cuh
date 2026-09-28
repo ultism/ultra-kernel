@@ -2,12 +2,17 @@
 // S3B-DV-WS: warp-specialized TMA-pipelined MXFP8 attention dV kernel (sm_120a).
 // dv_ws = dk_ws minus the dP gemm/delta: block = (kv tile n of 128, head).
 // Resident: K (+SF). Ring over q tiles of 64: Q (natural) + Dt (transposed dO).
-// Per m: S'=KQ^T, P'=exp(S'*sm-lse) quantized per-32-along-q, dV += P' * Dt.
+// Per m: S'=KQ^T, P'=exp(S'*sm-lse) quantized per-32-along-q IN REGISTERS +
+// S5 intra-quad shfl to the dV-A operand (no sDS smem round-trip); A-SF
+// register-broadcast, Dt B-SF gathered once per 32-dup group; dV += P' * Dt.
+// lse is indexed by q (streamed): per-thread LDG.64 pairs issued pre-wait —
+// no smem staging, no per-step NamedBarrier.
 #include <cstdio>
 #include <cstdint>
 #include <cuda_runtime.h>
 
 #include <cute/tensor.hpp>
+#include <cuda_fp8.h>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/mma_traits_sm120.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
@@ -116,11 +121,8 @@ struct SharedStorageDv {
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutKV>> sK;
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutQ>>  sQ;
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutQt>> sDt;
-  alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutDS>> sDS;
   alignas(128) cute::ArrayEngine<ElementSF, 512> sSFK;
   alignas(128) cute::ArrayEngine<ElementSF, 512 * kStages> sSFQ, sSFDt;
-  alignas(128) cute::ArrayEngine<ElementSF, 512> sSFDS;
-  alignas(16) float sLse[64];   // current q tile
   alignas(8) typename PipeQD::SharedStorage pipeline_qd;
   alignas(8) typename PipeQt::SharedStorage pipeline_qt;
 };
@@ -158,11 +160,10 @@ dv_ws_kernel(CUTE_GRID_CONSTANT ParamsDv const p) {
   PipeQt pipeline_qt(ss.pipeline_qt, pqt, Shape<_1, _1, _1>{});
   __syncthreads();
 
-  Tensor sK  = make_tensor(make_smem_ptr(ss.sK.begin()), SmemLayoutKV{});
-  Tensor sQ  = make_tensor(make_smem_ptr(ss.sQ.begin()), SmemLayoutQ{});
-  Tensor sDt = make_tensor(make_smem_ptr(ss.sDt.begin()), SmemLayoutQt{});
-  Tensor sDS = make_tensor(make_smem_ptr(ss.sDS.begin()), SmemLayoutDS{});
-  Tensor sSFK = make_tensor(make_smem_ptr(ss.sSFK.begin()), SmemLayoutSFT{});
+    Tensor sK  = make_tensor(make_smem_ptr(ss.sK.begin()), SmemLayoutKV{});
+    Tensor sQ  = make_tensor(make_smem_ptr(ss.sQ.begin()), SmemLayoutQ{});
+    Tensor sDt = make_tensor(make_smem_ptr(ss.sDt.begin()), SmemLayoutQt{});
+    Tensor sSFK = make_tensor(make_smem_ptr(ss.sSFK.begin()), SmemLayoutSFT{});
 
   if (wg == 0) {
     // -------- producer --------
@@ -238,15 +239,15 @@ dv_ws_kernel(CUTE_GRID_CONSTANT ParamsDv const p) {
     Tensor tSrSFK = mxfp8::partition_fragment_SFA(sSFK, thr128);
     Tensor tSrSFQ = mxfp8::partition_fragment_SFB(
         make_tensor(make_smem_ptr(ss.sSFQ.begin()), SmemLayoutSFT{}), thr128);
-    // dV operands (K=q=64): A = P' [kv,q], B = Dt [d,q]
-    Tensor tOrDS = thr64.partition_fragment_A(sDS);
+    // dV operands (K=q=64): A = P' [kv,q] (register-filled via the S5 intra-quad
+    // shfl below), B = Dt [d,q]
+    Tensor sDSshape = make_tensor(make_smem_ptr(static_cast<Element*>(nullptr)), SmemLayoutDS{});
+    Tensor tOrDS = thr64.partition_fragment_A(sDSshape);
     Tensor tOrDt = thr64.partition_fragment_B(sDt(_, _, _0{}));
     Tensor tOrSFDS = mxfp8::partition_fragment_SFA(
-        make_tensor(make_smem_ptr(ss.sSFDS.begin()), SmemLayoutSFK64{}), thr64);
+        make_tensor(make_smem_ptr(static_cast<ElementSF*>(nullptr)), SmemLayoutSFK64{}), thr64);
     Tensor tOrSFDt = mxfp8::partition_fragment_SFB(
         make_tensor(make_smem_ptr(ss.sSFDt.begin()), SmemLayoutSFK64{}), thr64);
-    Tensor sfpA_coord = mxfp8::partition_SFA(
-        make_identity_tensor(make_shape(Int<128>{}, Int<64>{})), thr64);
     Tensor sfpB_coord = mxfp8::partition_SFB(
         make_identity_tensor(make_shape(Int<128>{}, Int<64>{})), thr64);
 
@@ -255,7 +256,6 @@ dv_ws_kernel(CUTE_GRID_CONSTANT ParamsDv const p) {
     auto scSFA128 = make_tiled_copy_impl(SmemCopyAtomSF{}, mxfp8::get_layoutSFA_TV(mma128), make_shape(size<0>(ts128), size<2>(ts128)));
     auto scSFB128 = make_tiled_copy_impl(SmemCopyAtomSF{}, mxfp8::get_layoutSFB_TV(mma128), make_shape(size<1>(ts128), size<2>(ts128)));
     auto tscSFA128 = scSFA128.get_thread_slice(tid); auto tscSFB128 = scSFB128.get_thread_slice(tid);
-    auto scA64 = make_tiled_copy_A(SmemCopyAtomData{}, mma64); auto tscA64 = scA64.get_thread_slice(tid);
     auto scB64 = make_tiled_copy_B(SmemCopyAtomData{}, mma64); auto tscB64 = scB64.get_thread_slice(tid);
 
     copy(scA128, tscA128.partition_S(as_position_independent_swizzle_tensor(sK)), tscA128.retile_D(tSrK));
@@ -281,14 +281,21 @@ dv_ws_kernel(CUTE_GRID_CONSTANT ParamsDv const p) {
     };
     Tensor accS_rc = rc_view(accS);
     constexpr int kNRow = 2, kNCol = kBlockM / 4;   // 16 cols (q) per thread
-    int const row0 = warp * 16 + lane / 4;          // kv row
     int const col0 = (lane % 4) * 2;                // q col base
 
     StateQD rqd; StateQt rdt;
     auto step = [&](int m, auto hc) {
-      // lse for this q tile: cooperative 64-float smem load, issued pre-wait
-      if (tid < 64)
-        ss.sLse[tid] = p.lse[size_t(h) * p.S + m * kBlockM + tid];
+      // lse for this q tile: per-thread LDG.64 pairs, issued pre-wait (each
+      // lane's 16 q-cols are 8 fixed float2 pairs). No smem staging/barrier.
+      float lse_c[kNCol];
+      {
+        const float* lb = p.lse + size_t(h) * p.S + m * kBlockM + col0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t < kNCol / 2; ++t) {
+          float2 l2 = *reinterpret_cast<const float2*>(lb + t * 8);
+          lse_c[2 * t] = l2.x; lse_c[2 * t + 1] = l2.y;
+        }
+      }
       // ---- S' = K Q^T ----
       { auto t = pipeline_qd.consumer_try_wait(rqd); pipeline_qd.consumer_wait(rqd, t);
         int stage = rqd.index();
@@ -304,57 +311,76 @@ dv_ws_kernel(CUTE_GRID_CONSTANT ParamsDv const p) {
                    make_zip_tensor(tSrQ(_, _, k), tSrSFQ_h(_, _, k)), accS);
       pipeline_qd.consumer_release(rqd); ++rqd;
 
-      // ---- P' quantize per-32-along-q -> sDS [kv, q] + sSFDS ----
-      cutlass::arch::NamedBarrier(NumMmaThreads, kQuantBarrier).sync();   // prev m's readers done; sLse visible
+      // ---- P' quantize per-32-along-q -> registers (S5 intra-quad shfl) ----
+      // P' = exp(S'*sm - lse) <= 1 ALWAYS (lse >= row max), so a FIXED scale
+      // 256.0 (se=-8) never saturates e4m3 (<=448): no per-32 amax, no SHFL
+      // reduce, no scale-select — same argument as the fwd kernel's kPConstSF.
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < kNRow; ++mi) {
-        int kv = row0 + mi * 8;
         CUTLASS_PRAGMA_UNROLL
-        for (int kb = 0; kb < kBlockM / SFVecSize; ++kb) {
-          float as = 0.f;
-          float pv[8];
+        for (int ni = 0; ni < kNCol; ++ni)
+          accS_rc(mi, ni) = exp2f((accS_rc(mi, ni) * p.sm_scale - lse_c[ni]) * kLog2e);
+      }
+      // pack 32 quantized P' bytes per kv-row into 8 LE u32 words (S5 layout),
+      // two elements per cvt e4m3x2 via __nv_cvt_float2_to_fp8x2
+      uint32_t qw[kNRow][kNCol / 4];
+      CUTLASS_PRAGMA_UNROLL
+      for (int r = 0; r < kNRow; ++r) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int g = 0; g < kNCol / 4; ++g) {
+          uint32_t lo = __nv_cvt_float2_to_fp8x2(
+              make_float2(accS_rc(r, 4 * g) * 256.f, accS_rc(r, 4 * g + 1) * 256.f),
+              __NV_SATFINITE, __NV_E4M3);
+          uint32_t hi = __nv_cvt_float2_to_fp8x2(
+              make_float2(accS_rc(r, 4 * g + 2) * 256.f, accS_rc(r, 4 * g + 3) * 256.f),
+              __NV_SATFINITE, __NV_E4M3);
+          qw[r][g] = lo | (hi << 16);
+        }
+      }
+      // intra-quad shfl into the dV-A operand (verbatim S5)
+      {
+        Tensor tOrDS_u32 = recast<uint32_t>(tOrDS);
+        int const qb = lane & ~3, off = 2 * (lane & 1), half = (lane >> 1) & 1;
+        CUTLASS_PRAGMA_UNROLL
+        for (int mk = 0; mk < size<2>(tOrDS_u32); ++mk) {
           CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < 8; ++j) {
-            int ni = kb * 8 + j;
-            int c = (ni / 2) * 8 + col0 + (ni % 2);
-            pv[j] = exp2f((accS_rc(mi, ni) * p.sm_scale - ss.sLse[c]) * kLog2e);
-            as = fmaxf(as, fabsf(pv[j]));
-          }
-          as = fmaxf(as, __shfl_xor_sync(uint32_t(-1), as, 1));
-          as = fmaxf(as, __shfl_xor_sync(uint32_t(-1), as, 2));
-          int ses = mx_scale_exp(as);
-          if ((lane % 4) == 0)
-            ss.sSFDS.begin()[16 * (kv % 32) + 4 * (kv / 32) + kb] = ElementSF::bitcast(uint8_t(ses + 127));
-          CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < 8; ++j) {
-            int ni = kb * 8 + j;
-            int c = (ni / 2) * 8 + col0 + (ni % 2);
-            sDS(kv, c) = quant_e4m3(pv[j], ses);
+          for (int e2 = 0; e2 < 2; ++e2) {
+            int const g = e2 + 2 * mk;
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < kNRow; ++r) {
+              uint32_t wlo = __shfl_sync(0xffffffffu, qw[r][g], qb + off);
+              uint32_t whi = __shfl_sync(0xffffffffu, qw[r][g], qb + off + 1);
+              uint32_t lo = half ? (wlo >> 16) : (wlo & 0xffffu);
+              uint32_t hi = half ? (whi >> 16) : (whi & 0xffffu);
+              tOrDS_u32(make_coord(_0{}, r, e2), _0{}, mk) = lo | (hi << 16);
+            }
           }
         }
       }
-      cutlass::arch::NamedBarrier(NumMmaThreads, kQuantBarrier).sync();   // DS/SF visible
 
       // ---- dV += P' Dt ----
       { auto t = pipeline_qt.consumer_try_wait(rdt); pipeline_qt.consumer_wait(rdt, t);
         int stage = rdt.index();
         constexpr int hh = decltype(hc)::value;
         const uint8_t* sfDt_base = reinterpret_cast<const uint8_t*>(ss.sSFDt.begin()) + stage * 512 + 2 * hh;
-        copy(scA64, tscA64.partition_S(as_position_independent_swizzle_tensor(sDS)), tscA64.retile_D(tOrDS));
         copy(scB64, tscB64.partition_S(as_position_independent_swizzle_tensor(sDt(_, _, stage))), tscB64.retile_D(tOrDt));
+        // A-SF: compile-time constant byte (fixed P' scale se=-8 -> 119)
+        {
+          ElementSF const b = ElementSF::bitcast(uint8_t(-8 + 127));
+          CUTLASS_PRAGMA_UNROLL
+          for (int k = 0; k < size<2>(tOrSFDS); ++k)
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tOrSFDS(_, _, k)); ++i) tOrSFDS(_, _, k)(i) = b;
+        }
         CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < size<2>(tOrDS); ++k) {
+        for (int k = 0; k < size<2>(tOrSFDt); ++k) {
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tOrSFDS(_, _, k)); ++i) {
-            auto c = sfpA_coord(_, _, k)(i);
-            int kv = int(get<0>(c)), q = int(get<1>(c));
-            tOrSFDS(_, _, k)(i) = ElementSF::bitcast(ss.sSFDS.begin()[16 * (kv % 32) + 4 * (kv / 32) + q / 32].storage);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tOrSFDt(_, _, k)); ++i) {
-            auto c = sfpB_coord(_, _, k)(i);
-            int d = int(get<0>(c)), q = int(get<1>(c));
-            tOrSFDt(_, _, k)(i) = ElementSF::bitcast(sfDt_base[16 * (d % 32) + 4 * (d / 32) + q / 32]);
+          for (int r = 0; r < size(tOrSFDt(_, _, k)) / 32; ++r) {
+            auto c = sfpB_coord(_, _, k)(32 * r);
+            int d = int(get<0>(c)), kv = int(get<1>(c));
+            ElementSF const b = ElementSF::bitcast(sfDt_base[16 * (d % 32) + 4 * (d / 32) + kv / 32]);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < 32; ++i) tOrSFDt(_, _, k)(32 * r + i) = b;
           }
         }
         pipeline_qt.consumer_release(rdt); ++rdt; }
