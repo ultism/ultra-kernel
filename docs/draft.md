@@ -495,3 +495,14 @@ KernelWiki (B200) mining for dvdk2: nothing else transferable.
   pipe is 8.5% — and would break bitwise parity with mode 1.
 - scale_vec::2X (k64 blockscaled mma): fp4-only; fp8 has k32 only.
 Wiki confirms the dq-separate + dvdk-fused structure matches FA4's split.
+
+### c18: P-quant hoisted between S'/dP gemms — REJECTED (+12%)
+
+Hypothesis: P-phase ALU (exp2+cvt+shfl_fill) between the input gemms fills
+tensor bubbles via warp drift. Reality: 105-108 -> 118-121ms, tensor
+60.4 -> 54.5%. The 8 warps hit the same QD/TT barriers each tile and run in
+LOCKSTEP — there is no inter-warp phase slip to exploit; intra-warp phase
+reordering just moves the bubble and lengthens the mma issue path. The
+32-mma back-to-back burst (S'+dP adjacent) is what keeps the tensor pipe
+busy. Real overlap requires warps on DIFFERENT tiles (pingpong), which is
+register-walled (accS+accDP x2 = +64 regs at 255). Lesson logged; reverted.
