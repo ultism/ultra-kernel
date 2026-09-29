@@ -591,3 +591,34 @@ rejected on sm_120; free only on sm_100 (tcgen05 B smem descriptors).
 
 Note: probe also caught a debug pitfall - taking &(register_tensor(0)) and
 recast views can desync (local shadow vs registers); dump via plain arrays.
+
+### fwd s3 pack (f1): exp2-scale fold + rescale skip + tree reductions — KEPT (334cf8c)
+
+First fwd-side pass after bwd convergence. ncu on the 32,8 ragged bench (18.9k tokens,
+base clock, launch-skip 50): tensor 46.7%, LSU 29.5%, DRAM 45%, issue 41%, stalls
+wait=1.30 math_throttle=0.78 (dependency-chain bound between the two gemms, NOT
+barrier/memory). Three micros landed together:
+- **P carried 256x**: p256 = exp2f(fma(accS, sm2, 8-m*sm2)) — the kPScaleExp fold rides
+  the existing FMA, quant becomes a bare CVT (was FMUL+CVT x32/thread/block). row_sum
+  accumulates p256, unscaled once in the epilogue (exact pow2). out_Ppre dumps p256;
+  s3_e2e host replay unscales by 2^-8 (exact) -> bit-identical replay. Dynamic-scale
+  oracle path: amax on p256 shifts se by exactly +8, SF stores se-8 -> unchanged math.
+- **accO rescale skip**: `__all_sync(scales==1.0f)` skips the 64-FMUL pass when no row
+  max moved (x1.0f is a bitwise identity -> exact skip). Steady state skips most blocks.
+- **Tree reductions**: 4-way trees replace the 16-deep serial FMNMX (row_max, exact) and
+  FADD (row_sum, ~1ulp reassoc, tolerance-covered) chains.
+ncu same-launch: inst 423M -> 371M (-12.4%), tensor 46.7 -> 51.8%, fma pipe 14.5 -> 10.2%.
+Wall-clock A/B drowned by DVFS (same-binary spread 2.9-7.1ms!); instruction/pipe counters
+are the evidence. Regs unchanged (168). s6a bit-exact PASS, s3_e2e non-causal PASS.
+
+NOTE: **s3_e2e causal leg is PRE-EXISTING-broken** (identical failure on the Jul-21
+binary): its config Sq=384 > Sk=256 violates the offset_q>=0 convention the kernel
+adopted for slice-3; the host replay still uses the no-offset n_block_max. Real causal
+coverage = s6a (bit-exact vs dense oracle incl. offset>0 cases). Don't trust s3_e2e
+causal until its config is fixed (Sq<=Sk or teach the replay offset_q).
+
+Fwd remaining headroom: wait-stall 1.51 (softmax->quant->shfl->PV serial chain; 8 warps
+can't fully hide it), LSU 31% (B-frag 8x replication, structural), DRAM ~45% (O fp32
+write = 309MB/launch at 32 heads -- halving needs a bf16-O contract change in the
+integration). K stages 2->3 / V depth 2 rejected by c20 logic (barrier stall ~0, smem
+is not the constraint). WS-pingpong blocked by the c21 register wall.
