@@ -622,3 +622,16 @@ can't fully hide it), LSU 31% (B-frag 8x replication, structural), DRAM ~45% (O 
 write = 309MB/launch at 32 heads -- halving needs a bf16-O contract change in the
 integration). K stages 2->3 / V depth 2 rejected by c20 logic (barrier stall ~0, smem
 is not the constraint). WS-pingpong blocked by the c21 register wall.
+
+### fwd s3 (f2 / S15): bf16 O output — KEPT (a23c0fa), ~-9% at 32,8
+
+O was written fp32 [S,H,D] (309MB/launch at 32H/18.9k tokens) purely because the first
+consumer was an immediate `.to(bf16)` cast in mxfp8_attn.py, and the fp32 copy stayed
+pinned by save_for_backward. Kernel now stores bf16 (fp32 normalize in-reg, one CVT
+pass, 32b vector stores; S9d's 64b trick doesn't transfer to 4B pairs but the epilogue
+is once per work-item). bwd `delta` unchanged contract: `(o_shd*dO).sum(-1, kFloat)`
+forces fp32 accumulation. Harnesses: s6a reads back bf16 (dense-vs-ragged still
+bit-exact, max|abs|=0); s3_e2e converts to float for the oracle (max|rel| 3.3e-3 =
+bf16 rounding, tol 5e-3). Evidence: bench 32,8 median pairs 2.67 -> 2.43ms; ncu DRAM
+bytes 572 -> 395MB/launch (-31%), L2 write sectors -14%. Torch e2e sanity (H4/L4096,
+fwd vs fp32 SDPA + finite grads) PASS for AITK_DK_WS_MODE=1 and 3.
