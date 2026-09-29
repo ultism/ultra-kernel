@@ -549,3 +549,25 @@ nested fp8 A-frag <-> smem views MIS-VECTORIZES (6614/8192 wrong bytes);
 raw per-thread uint4 dump is exact and conflict-free (16B stride across
 lanes = 4 banks/lane x 8 lanes/phase). Also: dvdk2 smem re-measured at
 86.0KB (sK/sV 32 + sQ/sD 32 + sQt/sDt 16 + SF 4 + lse 1) -> 13KB free.
+
+### c22: dS' scale = exponent-bit construction — KEPT (dq_ws -1%, others flat)
+
+User audit of the SASS: the 8 source-level `exp2f(-ses)` per thread/tile were
+already CSE'd to 4 (unique ses values), BUT each cost a full subnormal-defense
+chain (IADD + I2FP + FSETP + predicated FMUL + MUFU.EX2 + fixup) on the
+already-throttled FMA pipe. Replaced with
+`__int_as_float((127 - min(ses,126)) << 23)` = exact 2^-ses in 2 int ops.
+Equivalence: ses in [-126,126] -> exact normal power of two; ses=127 only when
+amax is inf/nan (poisoned block; clamp differs from 2^-127 only for finite
+elems in such a block, which quantize to 0 either way... see note in code).
+SASS: EX2 144->128, I2FP 16->0, static instrs 5712->5656.
+Bitwise verified TWO ways vs unchanged oracles: dq_ws(c22) == dq_ws_ref(exp2f),
+dvdk2(c22) == dvdk3(exp2f). Bench: dq_ws 61.2->60.8ms (-1%), dvdk2/dk/dv flat.
+The 32 remaining EX2/thread/tile are the softmax P itself - inherent.
+
+### c23: fold log2e into lse/sm_scale (P = exp2f(a*sm2 - lse2)) — REVERTED
+
+dq_ws -3.5%, dv_ws -1.5%, but dvdk2 +4% (92.6 -> 96.0ms; ncu base-clock
+confirmed: 108 -> 114ms). Likely disturbs the 255-reg scheduling balance in
+the fused kernel. Also changes P rounding -> would break mode1/mode3 bitwise
+parity (our strongest regression detector). Net-negative for production.

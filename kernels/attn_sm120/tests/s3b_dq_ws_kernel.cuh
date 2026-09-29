@@ -394,7 +394,7 @@ dq_ws_kernel(CUTE_GRID_CONSTANT ParamsDq const p) {
       for (int r = 0; r < kNRow; ++r) {
         CUTLASS_PRAGMA_UNROLL
         for (int g = 0; g < kNCol / 4; ++g) {
-          float const sc = exp2f(float(-ses_r[r][g >> 1]));
+          float const sc = __int_as_float((127 - min(ses_r[r][g >> 1], 126)) << 23);  // c22: exact 2^-ses, no EX2
           uint32_t lo = __nv_cvt_float2_to_fp8x2(
               make_float2(accDP_rc(r, 4 * g) * sc, accDP_rc(r, 4 * g + 1) * sc),
               __NV_SATFINITE, __NV_E4M3);
