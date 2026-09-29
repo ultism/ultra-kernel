@@ -506,3 +506,20 @@ reordering just moves the bubble and lengthens the mma issue path. The
 32-mma back-to-back burst (S'+dP adjacent) is what keeps the tensor pipe
 busy. Real overlap requires warps on DIFFERENT tiles (pingpong), which is
 register-walled (accS+accDP x2 = +64 regs at 255). Lesson logged; reverted.
+
+### c20: dq_ws Kt ring 2->3 stages — REJECTED (+3%)
+
+dq_ws pcsamp (post-c15b): mma issue port 38.3%, barrier sleeping 7.6%,
+SF byte-gather 6.0%, LDSM wait 5.2%. sleeping looked like pipeline depth;
+Kt 3-stage fit (smem 87.0 -> 95.2KB <= 101376) but changed NOTHING
+(sleeping 9.12->9.20%, tensor 66.9% flat, +3% slower). The barrier waits
+are the WS rendezvous rhythm, not TMA-depth starvation. Reverted.
+
+## Closing assessment (dq + dvdk2 at structural ceiling)
+
+dvdk2 (98-106ms, tensor 60.5%) and dq_ws (65-72ms, tensor 63-67%) are both
+bounded by mma.sync's warp-level operand model on sm_120: B-operand
+replication x8 (LSU), 8-warp lockstep (no phase slip without +64 regs or
++32KB smem — both walled by 255 regs / 99KB optin), quant-phase tensor
+bubbles. All sm100 escapes (TMEM accumulators, tcgen05 smem operands,
+CLC) are datacenter-only. Remaining micro items <2% each.
