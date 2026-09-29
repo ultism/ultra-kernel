@@ -83,7 +83,7 @@ std::vector<torch::Tensor> mxfp8_attn(
 
   // ---- outputs (Ppre/Mnb are written unconditionally by the kernel; unused here) ----
   auto fopt = torch::dtype(torch::kFloat32).device(Qd.device());
-  auto O   = torch::empty({SQ, HD}, fopt);
+  auto O   = torch::empty({SQ, HD}, torch::dtype(torch::kBFloat16).device(Qd.device()));   // S15: bf16 O
   auto LSE = torch::empty({SQ}, fopt);
   auto Pdbg = torch::zeros({SQ, SK}, fopt);   // kernel's dequantized requant-P (debug oracle)
   auto Ppre = torch::zeros({SQ, SK}, fopt);   // kernel's pre-quant fp32 P
@@ -113,7 +113,7 @@ std::vector<torch::Tensor> mxfp8_attn(
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = float(sm_scale);
   params.o_scale = float(o_scale);     // S6b kUniformFp8: per-tensor v_scale (1.0 for the mxfp8 path)
   params.num_qo_heads = 1; params.num_kv_heads = 1;
-  params.out_O = O.data_ptr<float>(); params.out_lse = LSE.data_ptr<float>();
+  params.out_O = reinterpret_cast<cutlass::bfloat16_t*>(O.data_ptr()); params.out_lse = LSE.data_ptr<float>();
   // bench: nullptr Ppre/dbg -> kernel skips the full-P [SQ,SK] gmem dump that otherwise dominates time.
   params.out_l = dL; params.out_Mnb = dMnb;
   params.out_Ppre = bench ? nullptr : Ppre.data_ptr<float>();

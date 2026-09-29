@@ -87,7 +87,7 @@ extern "C" void s3_ragged_mx_launch(
     const void* sfQ, const void* sfK, const void* sfV,
     int Sq_pad, int Sk_pad, int Hq, int Hkv, int group,
     float sm_scale, int causal,
-    float* out_O, float* out_lse, float* out_l,
+    void* out_O_, float* out_lse, float* out_l,   // out_O_: bf16 [Sq,Hq,D]
     int* work_indptr, int* head_indices, int* qo_tile_indices,
     int* qo_indptr, int* kv_indptr, int* qo_lens, int* kv_lens, int* batch_indices,
     int num_sm, uintptr_t stream_);
@@ -151,7 +151,7 @@ static std::vector<at::Tensor> fwd_attn(
   auto opts_f = at::TensorOptions().dtype(at::kFloat).device(QdT.device());
   // pad q-tiles are skipped by the plan; zero ONLY the uncomputed tail so bwd's
   // delta/lse never see garbage bits (whole-tensor zeros when L%128 != 0)
-  at::Tensor O = at::empty({S, Hq, D}, opts_f);
+  at::Tensor O = at::empty({S, Hq, D}, at::TensorOptions().dtype(at::kBFloat16).device(QdT.device()));   // S15: bf16 O (half the epilogue DRAM write + no fp32->bf16 cast downstream)
   at::Tensor LSE = at::empty({Hq, S}, opts_f);
   const int covered = ((L + 127) / 128) * 128;
   if (covered < S) {
@@ -162,7 +162,7 @@ static std::vector<at::Tensor> fwd_attn(
   s3_ragged_mx_launch(QdT.data_ptr(), KdT.data_ptr(), Vt.data_ptr(),
                       sfQ.data_ptr(), sfK.data_ptr(), sfV.data_ptr(),
                       S, S, Hq, Hq, 1, float(sm_scale), 0,
-                      O.data_ptr<float>(), LSE.data_ptr<float>(), Lout.data_ptr<float>(),
+                      O.data_ptr(), LSE.data_ptr<float>(), Lout.data_ptr<float>(),
                       pl.work_indptr.data_ptr<int>(), pl.head_indices.data_ptr<int>(),
                       pl.qo_tile_indices.data_ptr<int>(), pl.qo_indptr.data_ptr<int>(),
                       pl.kv_indptr.data_ptr<int>(), pl.qo_lens.data_ptr<int>(),
@@ -189,7 +189,7 @@ static std::vector<at::Tensor> fwd_prep(at::Tensor q, at::Tensor k, at::Tensor v
 }
 
 // Fused bwd: quant dO, delta, mxfp8_bwd, post-scale + slice + bf16 cast.
-// o_shd: [S,H,D] fp32 raw fwd output. Returns dq/dk/dv bf16 [H,L,D].
+// o_shd: [S,H,D] bf16 raw fwd output (S15). Returns dq/dk/dv bf16 [H,L,D].
 static std::vector<at::Tensor> bwd_full(
     at::Tensor do_, at::Tensor Qd, at::Tensor Kd, at::Tensor Vd,
     at::Tensor Qt, at::Tensor Kt,
@@ -201,7 +201,7 @@ static std::vector<at::Tensor> bwd_full(
   auto dn = quant_op(do_, false);          // dd, _, sfd
   auto dt_ = quant_op(do_, true);          // dt, _, sfdt
   at::Tensor dop = at::constant_pad_nd(do_, {0, 0, 0, S - L});        // [H,S,D]
-  at::Tensor delta = (o_shd * dop.permute({1, 0, 2})).sum(-1).t().contiguous();
+  at::Tensor delta = (o_shd * dop.permute({1, 0, 2})).sum({-1}, false, at::kFloat).t().contiguous();   // o_shd bf16 (S15): force fp32 accumulation/dtype for the kernel
   at::Tensor lse_ = lse;
   if (lse_.size(-1) != S)
     lse_ = at::constant_pad_nd(lse_, {0, S - (int)lse_.size(-1)});

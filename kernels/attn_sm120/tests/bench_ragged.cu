@@ -59,7 +59,7 @@ static void place_sf(std::vector<uint8_t>& dst, Layout layout, const std::vector
       dst[layout(make_coord(row_off + r, b * SFVecSize, head))] = ue8m0_byte_pow2(exp[r * blocks + b]);
 }
 static Params make_params(Element* dQ, Element* dK, Element* dV, ElementSF* dSFQ, ElementSF* dSFK,
-                          ElementSF* dSFV, float* dO, float* dLSE, float* dL, float* dMnb,
+                          ElementSF* dSFV, cutlass::bfloat16_t* dO, float* dLSE, float* dL, float* dMnb,
                           int Sq_pad, int Sk_pad, int HD, float sm_scale, int num_qo_heads, int num_kv_heads) {
   auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(Sq_pad, int(kBlockN), HD, num_qo_heads));
   auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(Sk_pad, int(kBlockN), HD, num_kv_heads));
@@ -149,10 +149,10 @@ static float bench_ours(const std::vector<int>& lens, int num_qo_heads, int num_
         gSFV[gSFV_l(make_coord(h, kv_base[r] + b * SFVecSize, hk))] = ue8m0_byte_pow2(v.vexp[h * NVK + b]);
     }
   }
-  Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; float *dO,*dLSE,*dL,*dMnb;
+  Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; float *dLSE,*dL,*dMnb; cutlass::bfloat16_t *dO;
   cudaMalloc(&dQ, gQ.size()); cudaMalloc(&dK, gK.size()); cudaMalloc(&dV, gV.size());
   cudaMalloc(&dSFQ, gSFQ.size()); cudaMalloc(&dSFK, gSFK.size()); cudaMalloc(&dSFV, gSFV.size());
-  cudaMalloc(&dO, size_t(Sq_pad) * num_qo_heads * HD * sizeof(float)); cudaMalloc(&dLSE, size_t(num_qo_heads) * Sq_pad * sizeof(float));
+  cudaMalloc(&dO, size_t(Sq_pad) * num_qo_heads * HD * sizeof(cutlass::bfloat16_t)); cudaMalloc(&dLSE, size_t(num_qo_heads) * Sq_pad * sizeof(float));
   cudaMalloc(&dL, size_t(num_qo_heads) * Sq_pad * sizeof(float)); cudaMalloc(&dMnb, size_t(Sq_pad) * (Sk_pad / kBlockN) * sizeof(float));
   cudaMemcpy(dQ, gQ.data(), gQ.size(), cudaMemcpyHostToDevice);
   cudaMemcpy(dK, gK.data(), gK.size(), cudaMemcpyHostToDevice);

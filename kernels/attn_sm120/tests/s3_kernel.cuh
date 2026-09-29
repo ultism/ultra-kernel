@@ -227,7 +227,7 @@ struct Params {
   // so the kMxFp8 path (and every existing call site) is bit-exact. q_scale*k_scale fold into
   // sm_scale on the host (the score path needs no kernel change -- it already multiplies sm_scale).
   float o_scale = 1.0f;
-  float* out_O;     // token-major [seqlen_q, head_dim, num_qo_heads]: O(q,hd,h) at q*num_qo_heads*head_dim + h*head_dim + hd
+  cutlass::bfloat16_t* out_O;   // bf16 token-major [seqlen_q, head_dim, num_qo_heads]: O(q,hd,h) at q*num_qo_heads*head_dim + h*head_dim + hd
   float* out_lse;   // head-major [num_qo_heads, seqlen_q]: lse(h,q) at h*seqlen_q + q
   float* out_l;     // head-major [num_qo_heads, seqlen_q] row_sum (cross-check)
   float* out_Ppre;  // [seqlen_q, seqlen_k] device pre-quant fp32 P (host re-quantizes the SAME P)
@@ -826,11 +826,16 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         for (int ni = 0; ni < size<1>(accO_rc); ++ni) accO_rc(mi, ni) *= inv;
       }
       Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
-      // S9d: the C fragment's mode-0 is a stride-1 column PAIR (8B, provably aligned: col
-      // pairs are even, rows are 512B apart) -- but plain cute::copy assumes 128b alignment
-      // and falls back to scalar STG.E (SASS: 16.1/32B per sector). Force 64b vectorization
-      // -> STG.E.64, halving epilogue store instructions and L2 write sectors.
-      copy(AutoVectorizingCopyWithAssumedAlignment<64>{}, accO, thr_pv.partition_C(gO));
+      // S15: O is bf16 -- halves the epilogue DRAM write (the fp32 roundtrip existed only
+      // to feed an immediate .to(bf16) cast in the consumer, and the fp32 copy was pinned
+      // by save_for_backward). Normalize stays fp32 in registers; convert once here.
+      // The C fragment's mode-0 column pair is now 2xbf16 = 4B -> 32b vector stores
+      // (pairs are even cols, head_dim stride keeps 4B alignment; S9d's 64b fp32 trick
+      // doesn't transfer, but the epilogue runs once per work-item).
+      Tensor accO_out = make_fragment_like<cutlass::bfloat16_t>(accO);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(accO); ++i) accO_out(i) = cutlass::bfloat16_t(accO(i));
+      copy(AutoVectorizingCopyWithAssumedAlignment<32>{}, accO_out, thr_pv.partition_C(gO));
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < 2; ++mi) {
         int q_local = q_tile_local * kBlockM + warp * 16 + (lane / 4) + mi * 8;

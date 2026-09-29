@@ -21,7 +21,7 @@ extern "C" void s3_ragged_fp8_launch(
     const void* Qd, const void* Kd, const void* Vt,
     int Sq_pad, int Sk_pad, int Hq, int Hkv, int group,
     float sm_scale, float o_scale, int causal,
-    float* out_O, float* out_lse, float* out_l,
+    void* out_O_, float* out_lse, float* out_l,   // out_O_: bf16 [Sq,Hq,D]
     int* work_indptr, int* head_indices, int* qo_tile_indices,
     int* qo_indptr, int* kv_indptr, int* qo_lens, int* kv_lens, int* batch_indices,
     int num_sm, uintptr_t stream_);
@@ -62,7 +62,7 @@ std::vector<torch::Tensor> s3_ragged_fp8_attn(
   }
 
   auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(Qd.device());
-  auto O = torch::empty({Sq_pad, Hq, D}, opts_f);
+  auto O = torch::empty({Sq_pad, Hq, D}, torch::TensorOptions().dtype(torch::kBFloat16).device(Qd.device()));   // S15: bf16 O
   auto LSE = torch::empty({Hq, Sq_pad}, opts_f);
   auto L = torch::empty({Hq, Sq_pad}, opts_f);
 
@@ -106,7 +106,7 @@ std::vector<torch::Tensor> s3_ragged_fp8_attn(
         Qd.data_ptr(), Kd.data_ptr(), Vt.data_ptr(),
         Sq_pad, Sk_pad, Hq, Hkv, group,
         float(sm_scale), float(o_scale), causal ? 1 : 0,
-        O.data_ptr<float>(), LSE.data_ptr<float>(), L.data_ptr<float>(),
+        O.data_ptr(), LSE.data_ptr<float>(), L.data_ptr<float>(),
         d_work_indptr.data_ptr<int>(), d_head.data_ptr<int>(), d_qtile.data_ptr<int>(),
         d_qo_ip.data_ptr<int>(), d_kv_ip.data_ptr<int>(), d_qo_l.data_ptr<int>(),
         d_kv_l.data_ptr<int>(), d_batch.data_ptr<int>(), num_sm,

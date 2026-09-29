@@ -57,8 +57,11 @@ static int run_case(const char* tag, Params params, typename Scheduler::Argument
   s3_kernel<Scheduler, Causal><<<grid, kNThreads, smem_bytes>>>(params, sp);
   CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
-  std::vector<float> hO(SQ * HD), hLSE(SQ), hL(SQ), hPpre(SQ * SK), hMnb(SQ * n_block_total);
-  CK(cudaMemcpy(hO.data(), params.out_O, hO.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  std::vector<cutlass::bfloat16_t> hOb(SQ * HD);
+  std::vector<float> hLSE(SQ), hL(SQ), hPpre(SQ * SK), hMnb(SQ * n_block_total);
+  CK(cudaMemcpy(hOb.data(), params.out_O, hOb.size() * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost));
+  std::vector<float> hO(SQ * HD);
+  for (int i = 0; i < SQ * HD; ++i) hO[i] = float(hOb[i]);   // bf16 O -> float for the oracle compare
   CK(cudaMemcpy(hLSE.data(), params.out_lse, hLSE.size() * sizeof(float), cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(hL.data(), params.out_l, hL.size() * sizeof(float), cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(hPpre.data(), params.out_Ppre, hPpre.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -167,10 +170,10 @@ int main() {
   for (int h = 0; h < HD; ++h) for (int b = 0; b < NVK; ++b) hSFV[layoutSFV(make_coord(h, b * SFVecSize, 0))] = ue8m0_byte_pow2(vexp[h * NVK + b]);
 
   Element *dQ, *dK, *dV; ElementSF *dSFQ, *dSFK, *dSFV;
-  float *dO, *dLSE, *dL, *dPpre, *dMnb;
+  cutlass::bfloat16_t *dO; float *dLSE, *dL, *dPpre, *dMnb;
   CK(cudaMalloc(&dQ, hQ.size())); CK(cudaMalloc(&dK, hK.size())); CK(cudaMalloc(&dV, hV.size()));
   CK(cudaMalloc(&dSFQ, hSFQ.size())); CK(cudaMalloc(&dSFK, hSFK.size())); CK(cudaMalloc(&dSFV, hSFV.size()));
-  CK(cudaMalloc(&dO, SQ * HD * sizeof(float))); CK(cudaMalloc(&dLSE, SQ * sizeof(float)));
+  CK(cudaMalloc(&dO, SQ * HD * sizeof(cutlass::bfloat16_t))); CK(cudaMalloc(&dLSE, SQ * sizeof(float)));
   CK(cudaMalloc(&dL, SQ * sizeof(float))); CK(cudaMalloc(&dPpre, SQ * SK * sizeof(float)));
   CK(cudaMalloc(&dMnb, SQ * n_block_total * sizeof(float)));
   CK(cudaMemcpy(dQ, hQ.data(), hQ.size(), cudaMemcpyHostToDevice));

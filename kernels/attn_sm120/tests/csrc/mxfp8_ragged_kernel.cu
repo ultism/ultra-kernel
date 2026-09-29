@@ -13,7 +13,7 @@ extern "C" void s3_ragged_fp8_launch(
     const void* Qd, const void* Kd, const void* Vt,   // e4m3 uint8: [Sq,Hq,D] [Sk,Hkv,D] [Hkv,D,Sk]
     int Sq_pad, int Sk_pad, int Hq, int Hkv, int group,
     float sm_scale, float o_scale, int causal,
-    float* out_O, float* out_lse, float* out_l,
+    void* out_O_, float* out_lse, float* out_l,   // out_O_: bf16 [Sq,Hq,D]
     int* work_indptr, int* head_indices, int* qo_tile_indices,
     int* qo_indptr, int* kv_indptr, int* qo_lens, int* kv_lens, int* batch_indices,
     int num_sm, uintptr_t stream_) {
@@ -25,7 +25,7 @@ extern "C" void s3_ragged_fp8_launch(
   Element* dV = reinterpret_cast<Element*>(const_cast<void*>(Vt));
   // kUniformFp8: no SF tensors exist; the descriptors below point at out_O purely as a
   // valid aligned address (never dereferenced -- the kernel skips every SF TMA load).
-  ElementSF* dSF = reinterpret_cast<ElementSF*>(out_O);
+  ElementSF* dSF = reinterpret_cast<ElementSF*>(out_O_);
 
   auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(Sq_pad, int(kBlockN), HD, Hq));
   auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(Sk_pad, int(kBlockN), HD, Hkv));
@@ -48,7 +48,7 @@ extern "C" void s3_ragged_fp8_launch(
   p.seqlen_q = Sq_pad; p.seqlen_k = Sk_pad; p.n_block_total = Sk_pad / kBlockN;
   p.sm_scale = sm_scale; p.o_scale = o_scale;
   p.num_qo_heads = Hq; p.num_kv_heads = Hkv; p.tile_kv_len = nullptr;
-  p.out_O = out_O; p.out_lse = out_lse; p.out_l = out_l;
+  p.out_O = reinterpret_cast<cutlass::bfloat16_t*>(out_O_); p.out_lse = out_lse; p.out_l = out_l;
   p.out_Ppre = nullptr; p.out_Mnb = nullptr; p.out_dbg = nullptr;
 
   using Sched = BatchPrefillPersistentTileScheduler<int>;

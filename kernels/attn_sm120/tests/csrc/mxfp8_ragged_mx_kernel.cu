@@ -14,7 +14,7 @@ extern "C" void s3_ragged_mx_launch(
     const void* sfQ, const void* sfK, const void* sfV, // packed ue8m0: [Hq,Sq/128,512] [Hkv,Sk/128,512] [Hkv,Sk/128,512](SFB)
     int Sq_pad, int Sk_pad, int Hq, int Hkv, int group,
     float sm_scale, int causal,
-    float* out_O, float* out_lse, float* out_l,
+    void* out_O_, float* out_lse, float* out_l,   // out_O_: bf16 [Sq,Hq,D]
     int* work_indptr, int* head_indices, int* qo_tile_indices,
     int* qo_indptr, int* kv_indptr, int* qo_lens, int* kv_lens, int* batch_indices,
     int num_sm, uintptr_t stream_) {
@@ -49,7 +49,7 @@ extern "C" void s3_ragged_mx_launch(
   p.seqlen_q = Sq_pad; p.seqlen_k = Sk_pad; p.n_block_total = Sk_pad / kBlockN;
   p.sm_scale = sm_scale; p.o_scale = 1.0f;
   p.num_qo_heads = Hq; p.num_kv_heads = Hkv; p.tile_kv_len = nullptr;
-  p.out_O = out_O; p.out_lse = out_lse; p.out_l = out_l;
+  p.out_O = reinterpret_cast<cutlass::bfloat16_t*>(out_O_); p.out_lse = out_lse; p.out_l = out_l;
   p.out_Ppre = nullptr; p.out_Mnb = nullptr; p.out_dbg = nullptr;
 
   using Sched = BatchPrefillPersistentTileScheduler<int>;

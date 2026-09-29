@@ -90,7 +90,7 @@ static void place_sf(std::vector<uint8_t>& dst, Layout layout, const std::vector
 
 template <typename Scheduler, bool Causal>
 static void launch(Params params, typename Scheduler::Arguments sa, dim3 grid,
-                   std::vector<float>& hO, std::vector<float>& hLSE, int O_count, int lse_count) {
+                   std::vector<cutlass::bfloat16_t>& hO, std::vector<float>& hLSE, int O_count, int lse_count) {
   typename Scheduler::Params sp = Scheduler::to_underlying_arguments(sa);
   int smem = int(sizeof(SharedStorage));
   if (cudaFuncSetAttribute(s3_kernel<Scheduler, Causal>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess)
@@ -99,12 +99,12 @@ static void launch(Params params, typename Scheduler::Arguments sa, dim3 grid,
   if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
     { printf("launch fail: %s\n", cudaGetErrorString(cudaGetLastError())); std::exit(1); }
   hO.resize(O_count); hLSE.resize(lse_count);
-  cudaMemcpy(hO.data(), params.out_O, hO.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hO.data(), params.out_O, hO.size() * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost);
   cudaMemcpy(hLSE.data(), params.out_lse, hLSE.size() * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
 static Params make_params(Element* dQ, Element* dK, Element* dV, ElementSF* dSFQ, ElementSF* dSFK,
-                          ElementSF* dSFV, float* dO, float* dLSE, float* dL, float* dMnb,
+                          ElementSF* dSFV, cutlass::bfloat16_t* dO, float* dLSE, float* dL, float* dMnb,
                           int Sq_pad, int Sk_pad, int HD, float sm_scale,
                           int num_qo_heads, int num_kv_heads) {
   auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(Sq_pad, int(kBlockN), HD, num_qo_heads));
@@ -172,7 +172,8 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
 
   // ---------------- (1) per-(request,qo_head) DENSE oracle ----------------
   // Odense[r][hq] : [qo_pad, HD],  LSEdense[r][hq] : [qo_pad]
-  std::vector<std::vector<std::vector<float>>> Odense(B), LSEdense(B);
+  std::vector<std::vector<std::vector<cutlass::bfloat16_t>>> Odense(B);
+  std::vector<std::vector<std::vector<float>>> LSEdense(B);
   for (int r = 0; r < B; ++r) {
     Odense[r].resize(num_qo_heads); LSEdense[r].resize(num_qo_heads);
     const int NVK = kv_pad[r] / SFVecSize;
@@ -188,10 +189,10 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
       for (int h = 0; h < HD; ++h) for (int b = 0; b < NVK; ++b)
         hSFV[lSFV(make_coord(h, b * SFVecSize, 0))] = ue8m0_byte_pow2(v.vexp[h * NVK + b]);
 
-      Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; float *dO,*dLSE,*dL,*dMnb;
+      Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; cutlass::bfloat16_t *dO; float *dLSE,*dL,*dMnb;
       cudaMalloc(&dQ, q.Q.size()); cudaMalloc(&dK, v.K.size()); cudaMalloc(&dV, v.V.size());
       cudaMalloc(&dSFQ, hSFQ.size()); cudaMalloc(&dSFK, hSFK.size()); cudaMalloc(&dSFV, hSFV.size());
-      cudaMalloc(&dO, qo_pad[r] * HD * sizeof(float)); cudaMalloc(&dLSE, qo_pad[r] * sizeof(float));
+      cudaMalloc(&dO, qo_pad[r] * HD * sizeof(cutlass::bfloat16_t)); cudaMalloc(&dLSE, qo_pad[r] * sizeof(float));
       cudaMalloc(&dL, qo_pad[r] * sizeof(float)); cudaMalloc(&dMnb, size_t(qo_pad[r]) * (kv_pad[r] / kBlockN) * sizeof(float));
       cudaMemcpy(dQ, q.Q.data(), q.Q.size(), cudaMemcpyHostToDevice);
       cudaMemcpy(dK, v.K.data(), v.K.size(), cudaMemcpyHostToDevice);
@@ -204,7 +205,7 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
       using Sched = SingleTileScheduler;
       Sched::Arguments sm{cdiv(qo_len[r], kBlockM), 1, qo_len[r], kv_len[r], cutlass::FastDivmod(1)};
       dim3 grid = Sched::get_grid_dim(sm, query_num_sm());
-      std::vector<float> hO, hLSE;
+      std::vector<cutlass::bfloat16_t> hO; std::vector<float> hLSE;
       if (causal) launch<Sched, true >(p, sm, grid, hO, hLSE, qo_pad[r] * HD, qo_pad[r]);
       else        launch<Sched, false>(p, sm, grid, hO, hLSE, qo_pad[r] * HD, qo_pad[r]);
       Odense[r][hq] = hO; LSEdense[r][hq] = hLSE;
@@ -263,12 +264,12 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
       }
     }
 
-  Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; float *dO,*dLSE,*dL,*dMnb;
+  Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; cutlass::bfloat16_t *dO; float *dLSE,*dL,*dMnb;
   cudaMalloc(&dQ, gQ.size()); cudaMalloc(&dK, gK.size()); cudaMalloc(&dV, gV.size());
   cudaMalloc(&dSFQ, gSFQ.size()); cudaMalloc(&dSFK, gSFK.size()); cudaMalloc(&dSFV, gSFV.size());
-  cudaMalloc(&dO, size_t(Sq_pad) * num_qo_heads * HD * sizeof(float)); cudaMalloc(&dLSE, size_t(num_qo_heads) * Sq_pad * sizeof(float));
+  cudaMalloc(&dO, size_t(Sq_pad) * num_qo_heads * HD * sizeof(cutlass::bfloat16_t)); cudaMalloc(&dLSE, size_t(num_qo_heads) * Sq_pad * sizeof(float));
   cudaMalloc(&dL, size_t(num_qo_heads) * Sq_pad * sizeof(float)); cudaMalloc(&dMnb, size_t(Sq_pad) * (Sk_pad / kBlockN) * sizeof(float));
-  cudaMemset(dO, 0, size_t(Sq_pad) * num_qo_heads * HD * sizeof(float));
+  cudaMemset(dO, 0, size_t(Sq_pad) * num_qo_heads * HD * sizeof(cutlass::bfloat16_t));
   cudaMemcpy(dQ, gQ.data(), gQ.size(), cudaMemcpyHostToDevice);
   cudaMemcpy(dK, gK.data(), gK.size(), cudaMemcpyHostToDevice);
   cudaMemcpy(dV, gV.data(), gV.size(), cudaMemcpyHostToDevice);
@@ -311,7 +312,7 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
   sa.batch_indices = upload(batch_i); sa.group_size_fastdiv = cutlass::FastDivmod(group); sa.num_qo_heads = num_qo_heads;
   dim3 grid = Sched::get_grid_dim(sa, num_sm);
 
-  std::vector<float> rO, rLSE;
+  std::vector<cutlass::bfloat16_t> rO; std::vector<float> rLSE;
   if (causal) launch<Sched, true >(p, sa, grid, rO, rLSE, size_t(Sq_pad) * num_qo_heads * HD, size_t(num_qo_heads) * Sq_pad);
   else        launch<Sched, false>(p, sa, grid, rO, rLSE, size_t(Sq_pad) * num_qo_heads * HD, size_t(num_qo_heads) * Sq_pad);
 
@@ -324,8 +325,8 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
         double dl = std::abs((double)rLSE[size_t(hq) * Sq_pad + gq] - (double)LSEdense[r][hq][m]);
         max_lse = std::max(max_lse, dl);
         for (int d = 0; d < HD; ++d) {
-          double a = rO[(size_t(gq) * num_qo_heads + hq) * HD + d];   // token-major O
-          double b = Odense[r][hq][size_t(m) * HD + d];
+          double a = float(rO[(size_t(gq) * num_qo_heads + hq) * HD + d]);   // token-major O (bf16)
+          double b = float(Odense[r][hq][size_t(m) * HD + d]);
           double e = std::abs(a - b);
           // NaN/Inf-aware: a NaN ragged output (0*NaN poison) must FAIL. `NaN > tol` is false,
           // so the naive `e > tol` would silently pass it -- use isfinite + !(e <= tol).
@@ -336,7 +337,7 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
   printf("  [qo=%d kv=%d g=%d %-10s] grid=%u CTAs %d works | O max|abs|=%.3g LSE max|abs|=%.3g bad=%d\n",
          num_qo_heads, num_kv_heads, group, causal ? "causal" : "non-causal", grid.x, total_works, max_abs, max_lse, bad);
   if (bad) printf("    first bad: req=%d qhead=%d q=%d d=%d  ragged=%.6f dense=%.6f\n", fr, fh, fm, fd,
-                  rO[(size_t(qo_base[fr] + fm) * num_qo_heads + fh) * HD + fd], Odense[fr][fh][size_t(fm) * HD + fd]);
+                  float(rO[(size_t(qo_base[fr] + fm) * num_qo_heads + fh) * HD + fd]), float(Odense[fr][fh][size_t(fm) * HD + fd]));
 
   cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dSFQ); cudaFree(dSFK); cudaFree(dSFV);
   cudaFree(dO); cudaFree(dLSE); cudaFree(dL); cudaFree(dMnb);
