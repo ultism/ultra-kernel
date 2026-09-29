@@ -571,3 +571,23 @@ dq_ws -3.5%, dv_ws -1.5%, but dvdk2 +4% (92.6 -> 96.0ms; ncu base-clock
 confirmed: 108 -> 114ms). Likely disturbs the 255-reg scheduling balance in
 the fused kernel. Also changes P rounding -> would break mode1/mode3 bitwise
 parity (our strongest regression detector). Net-negative for production.
+
+### c24 probe: ldmatrix.m16n16.x2.trans.b8 for in-kernel Qt/Dt — REJECTED (layout incompatible)
+
+User noted sm_120a supports ldmatrix.m16n16.trans.b8 (true: cutlass
+SM100_U8x16_LDSM_T enables under SM120A). Probe `s3b_ldsmt_probe.cu`
+(pattern-encoded (q,d) readback vs golden LDSM_N-on-trn) shows the delivery
+lane map is TRANSPOSED vs the mma.sync m16n8k32 B-fragment requirement:
+  deliver(l,w) = tile(q = 16*(w>>1)+4*(l&3)+{0..3}, d = (l>>2)+8*(w&1)+16*nw)
+  gold  (l,g) = tile(q = 32*(l>>2)+{0-3|16-19},   d = 32*(l&3)+8*(g&1)+16*(g>>2))
+q and d swap lane-bit roles; gold lane1's content is physically delivered to
+delivery lane0 -> fix requires cross-lane redistribution (~32 SHFL/PRMT per
+thread per tile per tensor) = the same transpose tax relocated, not removed.
+The atom's RefLayout targets tcgen05-era fragments (pairs with
+stmatrix.m16n8.trans in sm100 epilogues), not mma.sync operands.
+Combined with: SF-trn is a DIFFERENT quant grouping (per-32-along-q amax, not
+a transpose), DRAM at 6%, smem not the binding constraint -> #4 stays
+rejected on sm_120; free only on sm_100 (tcgen05 B smem descriptors).
+
+Note: probe also caught a debug pitfall - taking &(register_tensor(0)) and
+recast views can desync (local shadow vs registers); dump via plain arrays.
