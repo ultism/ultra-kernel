@@ -81,6 +81,8 @@ static int run_case(const char* tag, Params params, typename Scheduler::Argument
     for (int nb = 0; nb < n_block_max; ++nb) {
       double rescale = std::exp2((double)sm_scale_log2 * (hMnb[m * n_block_total + nb] - Mlast));
       // per-32-key-block re-quant of the device's pre-quant P (bit-identical rule).
+      // NOTE: the kernel dumps p256 = 256*p (the +8 exp2 fold); unscale by 2^-8 (exact
+      // pow2) so the requant input is bit-identical to what the device quantized.
       double Pq[kBlockN];
       double Praw[kBlockN];
       for (int kb = 0; kb < NKB; ++kb) {
@@ -88,14 +90,14 @@ static int run_case(const char* tag, Params params, typename Scheduler::Argument
         if (kPDynamicScale) {
           float amax = 0.f;
           for (int j = 0; j < SFVecSize; ++j) amax = std::max(amax, std::fabs(hPpre[m * SK + nb * kBlockN + kb * SFVecSize + j]));
-          se = host_se(amax);
+          se = host_se(amax) - 8;   // amax on p256 -> host_se includes the +8; undo it
         } else {
           se = kPScaleExp;   // fixed scale 256.0, matching the kernel
         }
         double scale = std::ldexp(1.0, se), inv = std::ldexp(1.0, -se);
         for (int j = 0; j < SFVecSize; ++j) {
           int n = kb * SFVecSize + j;
-          float praw = hPpre[m * SK + nb * kBlockN + n];
+          float praw = hPpre[m * SK + nb * kBlockN + n] * 0.00390625f;   // p256 -> p (exact)
           Praw[n] = praw;
           Pq[n] = double(float(cutlass::float_e4m3_t(praw * (float)inv))) * scale;
         }

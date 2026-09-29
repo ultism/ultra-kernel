@@ -576,13 +576,24 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         }
 
         // ---- online softmax + accO rescale factor ----
+        // P is carried 256x-scaled (p256 = exp2(z+8) instead of p = exp2(z)): the +8 folds
+        // into the same FMA that forms z, so the e4m3 quantize below is a bare CVT (the old
+        // path paid a separate *256 FMUL per element). row_sum accumulates p256 and is
+        // unscaled once in the epilogue (exact pow2). out_Ppre therefore dumps p256 (the
+        // s3_e2e host replay unscales by 2^-8, also exact). e4m3 outcomes can differ from
+        // the old two-step path by ~1ulp on MUFU-input rounding boundaries (oracle tol 5e-3).
+        constexpr float kPFoldC = float(-kPScaleExp);   // +8.0 folded into the exp2 argument
         float scores_scale[2];
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < kNRow; ++mi) {
           float m_prev = row_max[mi];
-          float m_cur = m_prev;
+          // tree max (4x4) instead of a 16-deep serial FMNMX chain: max is order-exact.
+          float mt[kNCol / 4];
           CUTLASS_PRAGMA_UNROLL
-          for (int ni = 0; ni < kNCol; ++ni) m_cur = fmaxf(m_cur, accS_rc(mi, ni));
+          for (int g = 0; g < kNCol / 4; ++g)
+            mt[g] = fmaxf(fmaxf(accS_rc(mi, 4 * g + 0), accS_rc(mi, 4 * g + 1)),
+                          fmaxf(accS_rc(mi, 4 * g + 2), accS_rc(mi, 4 * g + 3)));
+          float m_cur = fmaxf(fmaxf(fmaxf(mt[0], mt[1]), fmaxf(mt[2], mt[3])), m_prev);
           m_cur = quad_reduce(m_cur, max_op);
           row_max[mi] = m_cur;
           float ss_mi = exp2f((m_prev - m_cur) * sm_scale_log2);   // first tile: m_prev=-inf -> 0
@@ -593,17 +604,23 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           // max P came out 0.99999988 < 1.0, dropping floor(log2) to -1, forcing the block scale
           // exponent one too low, and SATURATING the max element to 448*2^-9 = 0.875 (the 7/8 bug).
           float m_sub = (m_cur == -INFINITY) ? 0.f : m_cur;   // fully-masked row: keep -inf entries -> 0
-          row_sum[mi] *= ss_mi;
+          float const c256 = fmaf(-m_sub, sm_scale_log2, kPFoldC);   // z = fma(accS, sm2, c256) + 8 folded
+          // 4 partial sums instead of a 16-deep serial FADD chain (reassociates: ~1ulp
+          // row_sum wobble, covered by the oracle tolerance; dense-vs-ragged unaffected).
+          float rs[4] = {0.f, 0.f, 0.f, 0.f};
           CUTLASS_PRAGMA_UNROLL
           for (int ni = 0; ni < kNCol; ++ni) {
-            float p = exp2f((accS_rc(mi, ni) - m_sub) * sm_scale_log2);
+            float p = exp2f(fmaf(accS_rc(mi, ni), sm_scale_log2, c256));   // = 256 * p_raw
             accS_rc(mi, ni) = p;
-            row_sum[mi] += p;
+            rs[ni & 3] += p;
           }
+          row_sum[mi] = row_sum[mi] * ss_mi + ((rs[0] + rs[1]) + (rs[2] + rs[3]));
         }
 
         // dump pre-quant float P (host re-quantizes the IDENTICAL P) and running max --
         // the bit-exact reference replays the online algo from these device-side dumps.
+        // NOTE: accS now holds p256 = 256*p (the +8 exp2 fold); the s3_e2e host replay
+        // unscales by 2^-8 (exact pow2) before requant -> bit-identical replay preserved.
         // Guarded by the pointer so a timing build (out_Ppre=nullptr) skips the full-P
         // gmem write, which otherwise dominates the kernel time.
         if (params.out_Ppre != nullptr) {
@@ -634,13 +651,14 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
               CUTLASS_PRAGMA_UNROLL
               for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(accS_rc(mi, sfi * 8 + j)));
               amax = quad_reduce(amax, max_op);
-              se = mx_scale_exp(amax);
+              se = mx_scale_exp(amax);   // amax on 256x P -> se already includes the +8
             } else {
-              se = kPScaleExp;   // P<=1.0 guaranteed -> constant scale 256.0, no per-block amax
+              se = 0;   // const path: data = e4m3(p256) directly, SF stays 2^-8 (below)
             }
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 8; ++j) rP_rc(mi, sfi * 8 + j) = quant_e4m3(accS_rc(mi, sfi * 8 + j), se);
-            if (!kPConstSF && (lane % 4) == 0) ss.sSFP[q_local * NKB + sfi] = ElementSF::bitcast(uint8_t(se + 127));
+            // dynamic: P data = p256*2^-se, so the SF must be 2^(se-8) to reconstruct p.
+            if (!kPConstSF && (lane % 4) == 0) ss.sSFP[q_local * NKB + sfi] = ElementSF::bitcast(uint8_t(se - 8 + 127));
             if (params.out_dbg) {     // dequantized requant-P, indexed by logical (q, key)
               int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
               CUTLASS_PRAGMA_UNROLL
@@ -648,7 +666,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
                 int ni = sfi * 8 + j;
                 int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
                 params.out_dbg[q * params.seqlen_k + (kv_tile_base + nb) * kBlockN + col] =
-                    float(rP_rc(mi, ni)) * exp2f(float(se));
+                    float(rP_rc(mi, ni)) * exp2f(float(se - 8));   // dequant: SF = 2^(se-8)
               }
             }
           }
@@ -674,6 +692,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         static_assert(kPConstSF, "S5 shuffle path needs a fixed P scale (const SF); build -DS3_P_SMEM=1 for the dynamic-scale oracle");
         // Pack this thread's 32 quantized P bytes per q-row into 8 little-endian uint32 words:
         // word g (ni=4g..4g+3) holds keys {16g+2ql, +1, +8, +9} for this lane's ql=lane%4.
+        // accS holds p256 = 256*p already (the +8 exp2 fold) -> bare CVT, no *256 FMUL.
         uint32_t qw[kNRow][kNCol / 4];
         CUTLASS_PRAGMA_UNROLL
         for (int r = 0; r < kNRow; ++r) {
@@ -682,7 +701,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             uint32_t w = 0;
             CUTLASS_PRAGMA_UNROLL
             for (int b = 0; b < 4; ++b)
-              w |= uint32_t(quant_e4m3(accS_rc(r, 4 * g + b), kPScaleExp).storage) << (8 * b);
+              w |= uint32_t(Element(accS_rc(r, 4 * g + b)).storage) << (8 * b);
             qw[r][g] = w;
           }
         }
@@ -694,7 +713,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             for (int ni = 0; ni < kNCol; ++ni) {
               int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
               params.out_dbg[q * params.seqlen_k + (kv_tile_base + nb) * kBlockN + col] =
-                  float(quant_e4m3(accS_rc(r, ni), kPScaleExp)) * exp2f(float(kPScaleExp));
+                  float(Element(accS_rc(r, ni))) * exp2f(float(kPScaleExp));
             }
           }
         }
@@ -768,14 +787,19 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         // b = get<0,1> = M-row (scores_scale is per M-row), a = N column-pair.
         // NOTE: NOT bit-exact vs the old accB+telescope add order (~1e-7 rel, well inside
         // the fp64-oracle tolerance).
-        CUTLASS_PRAGMA_UNROLL
-        for (int a = 0; a < 2; ++a) {
+        // Skip the whole 64-FMUL pass when NO lane's row max moved this block (scale == 1
+        // exactly): multiply-by-1.0f is a bitwise identity, so the skip is exact. Steady
+        // state (max stabilized) skips nearly every block.
+        if (!__all_sync(0xffffffffu, scores_scale[0] == 1.f && scores_scale[1] == 1.f)) {
           CUTLASS_PRAGMA_UNROLL
-          for (int b = 0; b < 2; ++b) {
+          for (int a = 0; a < 2; ++a) {
             CUTLASS_PRAGMA_UNROLL
-            for (int c = 0; c < size<2>(accO); ++c) {
-              auto coord = make_coord(make_coord(a, b), _0{}, c);
-              accO(coord) = accO(coord) * scores_scale[b];
+            for (int b = 0; b < 2; ++b) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int c = 0; c < size<2>(accO); ++c) {
+                auto coord = make_coord(make_coord(a, b), _0{}, c);
+                accO(coord) = accO(coord) * scores_scale[b];
+              }
             }
           }
         }
@@ -790,8 +814,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
       }
 
       // ---- epilogue: finalize row_sum, normalize O, write LSE ----
+      // row_sum was accumulated on 256x-scaled P (the +8 exp2 fold): unscale once here
+      // (exact pow2) so inv/lse/l downstream are unchanged.
       CUTLASS_PRAGMA_UNROLL
-      for (int mi = 0; mi < 2; ++mi) row_sum[mi] = quad_reduce(row_sum[mi], add_op);
+      for (int mi = 0; mi < 2; ++mi) row_sum[mi] = quad_reduce(row_sum[mi], add_op) * 0.00390625f;   // 2^-8
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < size<0>(accO_rc); ++mi) {
         // o_scale folds the per-tensor v_scale (kUniformFp8); 1.0 for kMxFp8 -> bit-exact 1/row_sum.
