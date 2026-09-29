@@ -523,3 +523,29 @@ replication x8 (LSU), 8-warp lockstep (no phase slip without +64 regs or
 +32KB smem — both walled by 255 regs / 99KB optin), quant-phase tensor
 bubbles. All sm100 escapes (TMEM accumulators, tcgen05 smem operands,
 CLC) are datacenter-only. Remaining micro items <2% each.
+
+### c21: transient/acc 512-thread WG split (dvdk3) — REJECTED (+174%)
+
+User-proposed: transient WG (S'/dP gemm + quant) + acc WG (accK/accV gemm)
+with P'/dS' smem handoff, exploiting the 13KB smem headroom found after
+re-measuring (dvdk2 = 86.0KB, not 99KB as previously believed).
+
+Built `s3b_dvdk3_kernel.cuh`: 512thr, setmaxnreg 104/152, 8KB single-buffer
+staging (raw per-thread uint4 dump), 4 named barriers/tile (EmptyA/B chain).
+**Bitwise identical to dvdk2_nows.** But 256.8ms vs 93.5ms (+174%).
+
+ncu: tensor 60.5->20.5%, barrier stall 26.7%, long_scoreboard 23.7%
+(spill LDL/STL). Root cause = register conservation: monolith peaks at 255
+because accS/accDP (64) lifetime-overlap the output frags; the split's
+per-group peaks SUM: acc needs ~160 (128 acc + 32 working), transient needs
+~142 (64 accS/DP + ~40 TMA-lambda captures + ~38 working) = 302 > the 256
+per-thread-pair average (65536/512×2). ~46 regs x 256 thr forced to local
+memory in the hot loop. A 640-thread variant (separate TMA WG) closes even
+worse (X+Y <= 244 for the two compute roles). Phase-slip overlap is real
+but cannot pay for 30%+ of spills+seesaw.
+
+Side findings (kept): `s3b_stage_probe.cu` — cute elementwise copy() on
+nested fp8 A-frag <-> smem views MIS-VECTORIZES (6614/8192 wrong bytes);
+raw per-thread uint4 dump is exact and conflict-free (16B stride across
+lanes = 4 banks/lane x 8 lanes/phase). Also: dvdk2 smem re-measured at
+86.0KB (sK/sV 32 + sQ/sD 32 + sQt/sDt 16 + SF 4 + lse 1) -> 13KB free.

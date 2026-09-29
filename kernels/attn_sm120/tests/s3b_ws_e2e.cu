@@ -21,6 +21,7 @@
 #include "s3b_dv_ws_kernel.cuh"
 
 #include "s3b_dvdk2_kernel.cuh"
+#include "s3b_dvdk3_kernel.cuh"
 
 #include "s3b_dvdk_ws_kernel.cuh"
 
@@ -326,18 +327,9 @@ int main() {
   };
 
   // ---------------- dvdk2 (fused dv+dk @kv128) launch: ws / non-ws ----------------
-  auto launch_dvdk2 = [&](bool ws) {
-    static bool attr = false;
-    if (!attr) {
-      CK(cudaFuncSetAttribute((const void*)s3bdvdk2::dvdk2_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          int(sizeof(s3bdvdk2::SharedStorageDvdk))));
-      CK(cudaFuncSetAttribute((const void*)s3bdvdk2::dvdk2_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          int(sizeof(s3bdvdk2::SharedStorageDvdk))));
-      attr = true;
-    }
+  auto fill_dvdk_params = [&](s3bdvdk2::ParamsDvdk& p) {
     auto layoutSFQ = s3bdvdk2::BlkSF::tile_atom_to_shape_SFA(make_shape(S, int(s3bdvdk2::kBlockM), D, H));
     auto layoutSFQt = s3bdvdk2::BlkSF::tile_atom_to_shape_SFB(make_shape(int(s3bdvdk2::kBlockN), D, S, H));
-    s3bdvdk2::ParamsDvdk p{};
     cute::Tensor mQ = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::Element const*>(dQd)),
         cute::make_layout(make_shape(S, D, H), make_stride(D, cute::_1{}, S * D)));
     cute::Tensor mD = cute::make_tensor(cute::make_gmem_ptr(reinterpret_cast<s3bdvdk2::Element const*>(dDd)), mQ.layout());
@@ -377,6 +369,18 @@ int main() {
     p.lse_raw = dLse; p.dlt_raw = dDlt;
     p.dK = ddK2; p.dV = ddV2;
     p.S = S; p.H = H; p.sm_scale = float(sm);
+  };
+  auto launch_dvdk2 = [&](bool ws) {
+    static bool attr = false;
+    if (!attr) {
+      CK(cudaFuncSetAttribute((const void*)s3bdvdk2::dvdk2_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          int(sizeof(s3bdvdk2::SharedStorageDvdk))));
+      CK(cudaFuncSetAttribute((const void*)s3bdvdk2::dvdk2_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          int(sizeof(s3bdvdk2::SharedStorageDvdk))));
+      attr = true;
+    }
+    s3bdvdk2::ParamsDvdk p{};
+    fill_dvdk_params(p);
     if (ws) {
       s3bdvdk2::dvdk2_kernel<true><<<dim3(S / s3bdvdk2::kBlockN, H), 384,
                               int(sizeof(s3bdvdk2::SharedStorageDvdk))>>>(p);
@@ -384,6 +388,19 @@ int main() {
       s3bdvdk2::dvdk2_kernel<false><<<dim3(S / s3bdvdk2::kBlockN, H), 256,
                               int(sizeof(s3bdvdk2::SharedStorageDvdk))>>>(p);
     }
+    CK(cudaGetLastError());
+  };
+  auto launch_dvdk3 = [&] {
+    static bool attr = false;
+    if (!attr) {
+      CK(cudaFuncSetAttribute((const void*)s3bdvdk3::dvdk3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          int(sizeof(s3bdvdk3::SharedStorageDvdk3))));
+      attr = true;
+    }
+    s3bdvdk2::ParamsDvdk p{};
+    fill_dvdk_params(p);
+    s3bdvdk3::dvdk3_kernel<<<dim3(S / s3bdvdk2::kBlockN, H), 512,
+                            int(sizeof(s3bdvdk3::SharedStorageDvdk3))>>>(p);
     CK(cudaGetLastError());
   };
 
@@ -515,6 +532,8 @@ int main() {
   float t2w = bench("dvdk2_ws", [&] { launch_dvdk2(true); });
   float t2n = bench("dvdk2_nows", [&] { launch_dvdk2(false); });
   printf("dk+dv: %.3f  vs fused ws: %.3f  nows: %.3f ms\n", tk + tv, t2w, t2n);
+  if (getenv("S3B_DVDK3"))  // c21 rejected (+174%): kept for reference, opt-in only
+    printf("dvdk3_split: %.3f ms\n", bench("dvdk3_split", [&] { launch_dvdk3(); }));
   float t421 = bench("dvdk64_421", [&] { launch_dvdk64(false); });
   float t221 = bench("dvdk64_221", [&] { launch_dvdk64(true); });
   printf("fused kv64: (4,2,1)@256t: %.3f  (2,2,1)@128t: %.3f ms\n", t421, t221);
@@ -552,6 +571,34 @@ int main() {
     CK(cudaMemcpy(g2v.data(), ddV2, (size_t)S * D * 4, cudaMemcpyDeviceToHost));
     rel(g2k, rK, v ? "dK dvdk64_221" : "dK dvdk64_421");
     rel(g2v, rV, v ? "dV dvdk64_221" : "dV dvdk64_421");
+  }
+  // dvdk3 split prototype: rel-L2 vs fp64 ref + bitwise vs dvdk2_nows
+  {
+    CK(cudaMemset(ddK2, 0xFF, (size_t)H * S * D * 4)); CK(cudaMemset(ddV2, 0xFF, (size_t)H * S * D * 4));
+    launch_dvdk2(false); CK(cudaDeviceSynchronize());
+    std::vector<float> bk(S * D), bv(S * D);
+    CK(cudaMemcpy(bk.data(), ddK2, (size_t)S * D * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(bv.data(), ddV2, (size_t)S * D * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemset(ddK2, 0xFF, (size_t)H * S * D * 4)); CK(cudaMemset(ddV2, 0xFF, (size_t)H * S * D * 4));
+    launch_dvdk3(); CK(cudaDeviceSynchronize());
+    std::vector<float> g3k(S * D), g3v(S * D);
+    CK(cudaMemcpy(g3k.data(), ddK2, (size_t)S * D * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(g3v.data(), ddV2, (size_t)S * D * 4, cudaMemcpyDeviceToHost));
+    rel(g3k, rK, "dK dvdk3"); rel(g3v, rV, "dV dvdk3");
+    size_t badk = 0, badv = 0;
+    for (size_t i = 0; i < bk.size(); ++i) {
+      if (std::memcmp(&bk[i], &g3k[i], 4) != 0) ++badk;
+      if (std::memcmp(&bv[i], &g3v[i], 4) != 0) ++badv;
+    }
+    printf("dvdk3 bitwise vs dvdk2_nows: dK %s (%zu/%zu)  dV %s (%zu/%zu)\n",
+           badk ? "MISMATCH" : "MATCH", badk, bk.size(),
+           badv ? "MISMATCH" : "MATCH", badv, bv.size());
+    if (getenv("S3B_DEBUG")) {
+      for (int off : {0, 1, 2, 63, 64, 4096, 8192}) {
+        printf("  [%5d] dV ref %9.4f  dvdk3 %9.4f   dK ref %9.4f  dvdk3 %9.4f\n",
+               off, bv[off], g3v[off], bk[off], g3k[off]);
+      }
+    }
   }
 #endif
   return 0;
