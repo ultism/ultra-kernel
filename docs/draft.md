@@ -635,3 +635,26 @@ bit-exact, max|abs|=0); s3_e2e converts to float for the oracle (max|rel| 3.3e-3
 bf16 rounding, tol 5e-3). Evidence: bench 32,8 median pairs 2.67 -> 2.43ms; ncu DRAM
 bytes 572 -> 395MB/launch (-31%), L2 write sectors -14%. Torch e2e sanity (H4/L4096,
 fwd vs fp32 SDPA + finite grads) PASS for AITK_DK_WS_MODE=1 and 3.
+
+### fwd s3 block-level software pipeline (S16/S17) — REJECTED (hardware-locked dead end)
+
+Goal: hoist QK(nb+1) one block early (accS ping-pong) so the tensor pipe crunches gemms
+across the softmax ALU chain. Three-link chain, every link hardware-locked on sm_120:
+1. ping-pong needs ~200+ regs > the 168-reg cap. Root cause of the cap: the register
+   file is 16384/SMSP and warps pin to subpartitions -- 384thr = 3 warps/SMSP ->
+   floor(16384/96) = 168 (setmaxnreg is a NO-OP on this toolchain, confirmed by ptxas:
+   288thr caps at 168 + spills; 256thr gets 255).
+2. <=8 warps (256thr) for the 256-reg cap forces producer-in-consumer (no warp left for
+   a dedicated producer; the pump must issue TMA from consumer threads).
+3. Pump-in-consumer convoys: cutlass barrier waits are nanosleep-backoff loops, so the
+   leader threads (3 of 8 compute warps) SLEEP waiting for the pack's releases every
+   block -> stalled_sleeping 4.28 vs 0.49, issue_active 41% -> 19%, 2.4x SLOWER even
+   with 0 spills and identical per-block math. A dedicated producer warp is irreplaceable
+   precisely because it is the warp allowed to sleep.
+Incidental findings worth keeping: try_acquire pumps self-deadlock unless the leader
+pumps-until-issued before its own waits (leader outruns the pack's empty-barrier
+arrivals, then blocks on a tile only it can issue); blocking single-step pumps need
+item-0 priming and NO work-top K/V refill (the ring stays 2-ahead across items).
+The accS ping-pong + qk/softmax_pv split + pumps passed s6a bit-exact and s3_e2e
+(/tmp/s3_e.cuh lineage), kept only as reference -- perf was unacceptable in all
+256-thread variants. Fwd stays at f1+bf16 (tensor ~55%, 2.5ms @ 32,8).
