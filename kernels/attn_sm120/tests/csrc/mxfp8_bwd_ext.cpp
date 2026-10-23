@@ -5,6 +5,8 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <ATen/cuda/CUDAContext.h>
@@ -30,6 +32,22 @@ extern "C" void mxfp8_dvdk_ws_launch(
 extern "C" void mxfp8_dv_ws_launch(
     const void*, const void*, const void*, const void*, const void*, const void*,
     const float*, float*, int, int, float, uintptr_t);
+// S3M masked (block-causal) kernels, mxfp8_bc_kernel.cu
+extern "C" void s3m_ragged_mx_launch(
+    const void*, const void*, const void*, const void*, const void*, const void*,
+    int, int, int, int, int, float, void*, float*, float*,
+    int*, int*, int*, int*, int*, int*, int*, int*, const int*, int, uintptr_t);
+extern "C" void mxfp8_dv_ws_bc_launch(
+    const void*, const void*, const void*, const void*, const void*, const void*,
+    const float*, float*, int, int, int, float, const int*, uintptr_t);
+extern "C" void mxfp8_dk_ws_bc_launch(
+    const void*, const void*, const void*, const void*, const void*,
+    const void*, const void*, const void*, const void*, const void*,
+    const float*, const float*, float*, int, int, int, float, const int*, uintptr_t);
+extern "C" void mxfp8_dq_ws_bc_launch(
+    const void*, const void*, const void*, const void*, const void*,
+    const void*, const void*, const void*, const void*, const void*,
+    const float*, const float*, float*, int, int, int, float, const int*, uintptr_t);
 
 static std::vector<at::Tensor> mxfp8_bwd(
     at::Tensor Qd, at::Tensor Kd, at::Tensor Vd, at::Tensor Dd,
@@ -100,24 +118,27 @@ struct RaggedPlan {
   at::Tensor work_indptr, head_indices, qo_tile_indices, qo_indptr, kv_indptr,
              qo_lens, kv_lens, batch_indices;
 };
-static std::unordered_map<int64_t, RaggedPlan> g_plan_cache;
+static std::map<std::tuple<int, int, int, int, int>, RaggedPlan> g_plan_cache;  // (Sq, Sk, Lq, Lkv, Hq)
 static int g_num_sm = 0;
 }  // namespace
 
 static std::vector<at::Tensor> fwd_attn(
-    at::Tensor QdT, at::Tensor KdT, at::Tensor Vt,   // [S,H,D] [S,H,D] [H,D,S] uint8
+    at::Tensor QdT, at::Tensor KdT, at::Tensor Vt,   // [Sq,H,D] [Sk,H,D] [H,D,Sk] uint8
     at::Tensor sfQ, at::Tensor sfK, at::Tensor sfV,  // packed ue8m0
-    int64_t L_, double sm_scale) {
-  const int S = QdT.size(0), Hq = QdT.size(1), D = QdT.size(2);
+    int64_t L_, double sm_scale, int64_t Lkv_) {
+  const int Sq = QdT.size(0), Hq = QdT.size(1), D = QdT.size(2);
+  const int Sk = KdT.size(0);
   const int L = int(L_);
-  TORCH_CHECK(D == 128 && S % 128 == 0);
+  const int Lkv = Lkv_ > 0 ? int(Lkv_) : L;   // Lq != Lkv: cached-decode
+  TORCH_CHECK(D == 128 && Sq % 128 == 0 && Sk % 128 == 0);
+  TORCH_CHECK(KdT.size(1) == Hq && Vt.size(0) == Hq && Vt.size(2) == Sk);
   if (g_num_sm == 0) cudaDeviceGetAttribute(&g_num_sm, cudaDevAttrMultiProcessorCount, QdT.get_device());
-  const int64_t key = (int64_t(S) << 40) ^ (int64_t(L) << 16) ^ (int64_t(Hq) << 1);
+  const auto key = std::make_tuple(Sq, Sk, L, Lkv, Hq);
   auto it = g_plan_cache.find(key);
   if (it == g_plan_cache.end()) {
     constexpr int kBM = 128, kBN = 64;
     auto cdiv = [](int a, int b) { return (a + b - 1) / b; };
-    const int nqt = cdiv(L, kBM), nkt = cdiv(L, kBN);
+    const int nqt = cdiv(L, kBM), nkt = cdiv(Lkv, kBN);
     struct W { int qhead, qtile; long cost; };
     std::vector<W> works;
     works.reserve(size_t(nqt) * Hq);
@@ -134,7 +155,7 @@ static std::vector<at::Tensor> fwd_attn(
     for (int c = 0; c < g_num_sm; ++c) work_indptr[c + 1] = work_indptr[c] + int(cta[c].size());
     for (int c = 0; c < g_num_sm; ++c) for (auto& w : cta[c]) {
       head_i.push_back(w.qhead); qtile_i.push_back(w.qtile);
-      qo_ip_v.push_back(0); kv_ip_v.push_back(0); qo_l_v.push_back(L); kv_l_v.push_back(L); batch_i.push_back(0);
+      qo_ip_v.push_back(0); kv_ip_v.push_back(0); qo_l_v.push_back(L); kv_l_v.push_back(Lkv); batch_i.push_back(0);
     }
     auto up = [&](const std::vector<int>& v) {
       auto t = at::empty({int64_t(std::max<size_t>(1, v.size()))},
@@ -151,17 +172,17 @@ static std::vector<at::Tensor> fwd_attn(
   auto opts_f = at::TensorOptions().dtype(at::kFloat).device(QdT.device());
   // pad q-tiles are skipped by the plan; zero ONLY the uncomputed tail so bwd's
   // delta/lse never see garbage bits (whole-tensor zeros when L%128 != 0)
-  at::Tensor O = at::empty({S, Hq, D}, at::TensorOptions().dtype(at::kBFloat16).device(QdT.device()));   // S15: bf16 O (half the epilogue DRAM write + no fp32->bf16 cast downstream)
-  at::Tensor LSE = at::empty({Hq, S}, opts_f);
+  at::Tensor O = at::empty({Sq, Hq, D}, at::TensorOptions().dtype(at::kBFloat16).device(QdT.device()));   // S15: bf16 O (half the epilogue DRAM write + no fp32->bf16 cast downstream)
+  at::Tensor LSE = at::empty({Hq, Sq}, opts_f);
   const int covered = ((L + 127) / 128) * 128;
-  if (covered < S) {
-    O.narrow(0, covered, S - covered).zero_();
-    LSE.narrow(1, covered, S - covered).zero_();
+  if (covered < Sq) {
+    O.narrow(0, covered, Sq - covered).zero_();
+    LSE.narrow(1, covered, Sq - covered).zero_();
   }
-  at::Tensor Lout = at::empty({Hq, S}, opts_f);
+  at::Tensor Lout = at::empty({Hq, Sq}, opts_f);
   s3_ragged_mx_launch(QdT.data_ptr(), KdT.data_ptr(), Vt.data_ptr(),
                       sfQ.data_ptr(), sfK.data_ptr(), sfV.data_ptr(),
-                      S, S, Hq, Hq, 1, float(sm_scale), 0,
+                      Sq, Sk, Hq, Hq, 1, float(sm_scale), 0,
                       O.data_ptr(), LSE.data_ptr<float>(), Lout.data_ptr<float>(),
                       pl.work_indptr.data_ptr<int>(), pl.head_indices.data_ptr<int>(),
                       pl.qo_tile_indices.data_ptr<int>(), pl.qo_indptr.data_ptr<int>(),
@@ -222,10 +243,106 @@ static std::vector<at::Tensor> bwd_full(
   return {oq, ok, ov};
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("quant_nat", [](at::Tensor x) { return quant_op(x, false); }, "fused mxfp8 natural quant (pads to S)");
+// Block-causal (S3M) fwd: caller-built plan + per-row key limits.
+static std::vector<at::Tensor> fwd_attn_bc(
+    at::Tensor QdT, at::Tensor KdT, at::Tensor Vt,
+    at::Tensor sfQ, at::Tensor sfK, at::Tensor sfV,
+    int64_t L_, double sm_scale,
+    at::Tensor work_indptr, at::Tensor head_indices, at::Tensor qo_tile_indices,
+    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor qo_lens,
+    at::Tensor kv_lens, at::Tensor batch_indices, at::Tensor row_kv_limit) {
+  const int Sq = QdT.size(0), Hq = QdT.size(1), D = QdT.size(2);
+  const int Sk = KdT.size(0);
+  const int L = int(L_);
+  TORCH_CHECK(D == 128 && Sq % 128 == 0 && Sk % 128 == 0);
+  TORCH_CHECK(KdT.size(1) == Hq && Vt.size(0) == Hq && Vt.size(2) == Sk,
+              "fwd_attn_bc: KdT [Sk,H,D], Vt [H,D,Sk] expected");
+  TORCH_CHECK(row_kv_limit.size(0) >= Sq);
+  if (g_num_sm == 0) cudaDeviceGetAttribute(&g_num_sm, cudaDevAttrMultiProcessorCount, QdT.get_device());
+  auto opts_f = at::TensorOptions().dtype(at::kFloat).device(QdT.device());
+  at::Tensor O = at::empty({Sq, Hq, D}, at::TensorOptions().dtype(at::kBFloat16).device(QdT.device()));
+  at::Tensor LSE = at::empty({Hq, Sq}, opts_f);
+  const int covered = ((L + 127) / 128) * 128;
+  if (covered < Sq) {
+    O.narrow(0, covered, Sq - covered).zero_();
+    LSE.narrow(1, covered, Sq - covered).zero_();
+  }
+  at::Tensor Lout = at::empty({Hq, Sq}, opts_f);
+  s3m_ragged_mx_launch(QdT.data_ptr(), KdT.data_ptr(), Vt.data_ptr(),
+                       sfQ.data_ptr(), sfK.data_ptr(), sfV.data_ptr(),
+                       Sq, Sk, Hq, Hq, 1, float(sm_scale),
+                       O.data_ptr(), LSE.data_ptr<float>(), Lout.data_ptr<float>(),
+                       work_indptr.data_ptr<int>(), head_indices.data_ptr<int>(),
+                       qo_tile_indices.data_ptr<int>(), qo_indptr.data_ptr<int>(),
+                       kv_indptr.data_ptr<int>(), qo_lens.data_ptr<int>(),
+                       kv_lens.data_ptr<int>(), batch_indices.data_ptr<int>(),
+                       row_kv_limit.data_ptr<int>(),
+                       g_num_sm, uintptr_t(at::cuda::getCurrentCUDAStream().stream()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {O, LSE};
+}
+
+// Block-causal (S3M) bwd: same buffer contracts as bwd_full, masked mode-1 kernels.
+static std::vector<at::Tensor> bwd_full_bc(
+    at::Tensor do_, at::Tensor Qd, at::Tensor Kd, at::Tensor Vd,
+    at::Tensor Qt, at::Tensor Kt,
+    at::Tensor sfQ, at::Tensor sfK, at::Tensor sfV,
+    at::Tensor sfQt, at::Tensor sfKt,
+    at::Tensor lse, at::Tensor o_shd, double sm_scale,
+    at::Tensor row_kv_limit) {
+  const int H = do_.size(0), L = do_.size(1);
+  const int S = Qd.size(1);
+  const int D = Qd.size(2);
+  TORCH_CHECK(D == 128 && S % 128 == 0, "bwd_full_bc: need head_dim=128, S%128==0");
+  TORCH_CHECK(row_kv_limit.size(0) >= S);
+  auto dn = quant_op(do_, false);          // dd, _, sfd
+  auto dt_ = quant_op(do_, true);          // dt, _, sfdt
+  at::Tensor dop = at::constant_pad_nd(do_, {0, 0, 0, S - L});
+  at::Tensor delta = (o_shd * dop.permute({1, 0, 2})).sum({-1}, false, at::kFloat).t().contiguous();
+  at::Tensor lse_ = lse;
+  if (lse_.size(-1) != S)
+    lse_ = at::constant_pad_nd(lse_, {0, S - (int)lse_.size(-1)});
+  lse_ = lse_.contiguous();
+  auto opts = at::TensorOptions().dtype(at::kFloat).device(do_.device());
+  at::Tensor dQ = at::empty({H, S, D}, opts);
+  at::Tensor dK = at::empty({H, S, D}, opts);
+  at::Tensor dV = at::empty({H, S, D}, opts);
+  auto stream = uintptr_t(at::cuda::getCurrentCUDAStream().stream());
+  mxfp8_dv_ws_bc_launch(Kd.data_ptr(), Qd.data_ptr(), dt_[0].data_ptr(),
+                        sfK.data_ptr(), sfQ.data_ptr(), dt_[2].data_ptr(),
+                        lse_.data_ptr<float>(), dV.data_ptr<float>(), S, H, L,
+                        float(sm_scale), row_kv_limit.data_ptr<int>(), stream);
+  mxfp8_dk_ws_bc_launch(Kd.data_ptr(), Vd.data_ptr(), Qd.data_ptr(), dn[0].data_ptr(),
+                        Qt.data_ptr(), sfK.data_ptr(), sfV.data_ptr(), sfQ.data_ptr(),
+                        dn[2].data_ptr(), sfQt.data_ptr(), lse_.data_ptr<float>(),
+                        delta.data_ptr<float>(), dK.data_ptr<float>(), S, H, L,
+                        float(sm_scale), row_kv_limit.data_ptr<int>(), stream);
+  mxfp8_dq_ws_bc_launch(Kd.data_ptr(), Vd.data_ptr(), Kt.data_ptr(), Qd.data_ptr(),
+                        dn[0].data_ptr(), sfK.data_ptr(), sfV.data_ptr(), sfKt.data_ptr(),
+                        sfQ.data_ptr(), dn[2].data_ptr(), lse_.data_ptr<float>(),
+                        delta.data_ptr<float>(), dQ.data_ptr<float>(), S, H, L,
+                        float(sm_scale), row_kv_limit.data_ptr<int>(), stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // fp32 grads -> bf16, sliced to L rows, kernels' folded sm_scale divided out (q/k)
+  auto opts_o = at::TensorOptions().dtype(at::kBFloat16).device(do_.device());
+  at::Tensor oq = at::empty({H, L, 128}, opts_o);
+  at::Tensor ok = at::empty({H, L, 128}, opts_o);
+  at::Tensor ov = at::empty({H, L, 128}, opts_o);
+  scale_slice_cast_launch(dQ.data_ptr(), dK.data_ptr(), dV.data_ptr(),
+                          oq.data_ptr(), ok.data_ptr(), ov.data_ptr(),
+                          float(sm_scale), H, S, L,
+                          uintptr_t(at::cuda::getCurrentCUDAStream().stream()));
+  return {oq, ok, ov};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {  m.def("quant_nat", [](at::Tensor x) { return quant_op(x, false); }, "fused mxfp8 natural quant (pads to S)");
   m.def("fwd_prep", &fwd_prep, "fused fwd quant+layout prep");
-  m.def("fwd_attn", &fwd_attn, "ragged mxfp8 fwd, cached plan, packed SF");
+  m.def("fwd_attn_bc", &fwd_attn_bc, "block-causal mxfp8 fwd (per-row key limits + caller plan)");
+  m.def("bwd_full_bc", &bwd_full_bc, "block-causal mxfp8 bwd (masked mode-1 kernels)");
+  m.def("fwd_attn", &fwd_attn, "ragged mxfp8 fwd, cached plan, packed SF; Lkv>0 = cached-decode Lq!=Lkv",
+        py::arg("QdT"), py::arg("KdT"), py::arg("Vt"),
+        py::arg("sfQ"), py::arg("sfK"), py::arg("sfV"),
+        py::arg("L"), py::arg("sm_scale"), py::arg("Lkv") = -1);
   m.def("bwd_full", &bwd_full, "fused bwd: quant dO + delta + kernels + postprocess");
   m.def("quant_trn", [](at::Tensor x) { return quant_op(x, true); }, "fused mxfp8 transposed quant (pads to S)"); m.def("mxfp8_bwd", &mxfp8_bwd, "mxfp8 attention bwd");
   m.def("dvdk_ws", [](at::Tensor Kd, at::Tensor Vd, at::Tensor Qd, at::Tensor Dd,
